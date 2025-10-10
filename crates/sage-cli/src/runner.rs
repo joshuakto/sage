@@ -6,10 +6,10 @@ use csv::ByteRecord;
 use log::info;
 use rayon::prelude::*;
 use sage_cloudpath::{CloudPath, FileFormat};
-use sage_core::database::{IndexedDatabase, Parameters, PeptideIx};
+use sage_core::database::{IndexedDatabase, Parameters};
 use sage_core::fasta::Fasta;
 use sage_core::ion_series::Kind;
-use sage_core::lfq::{Peak, PrecursorId};
+use sage_core::lfq::{PeptideQuantTrace, PrecursorId};
 use sage_core::mass::Tolerance;
 use sage_core::peptide::Peptide;
 use sage_core::scoring::Fragments;
@@ -142,14 +142,17 @@ impl Runner {
     pub fn prefilter_peptides(self, parallel: usize, fasta: Fasta) -> Vec<Peptide> {
         let spectra: Option<Vec<ProcessedSpectrum<_>>> =
             match parallel >= self.parameters.mzml_paths.len() {
-                true => Some(self.read_processed_spectra(&self.parameters.mzml_paths, 0, 0).1),
+                true => Some(
+                    self.read_processed_spectra(&self.parameters.mzml_paths, 0, 0)
+                        .1,
+                ),
                 false => None,
             };
-        
+
         let mut db_params = self.parameters.database.clone();
         // TODO: Don't generate decoys for fast searching
         // * if `generate_decoys` is used, we should re-generate at the end
-        //  to ensure that picked-peptide conditions are used, otherwise, 
+        //  to ensure that picked-peptide conditions are used, otherwise,
         //  if the user supplied decoys in the fasta file, then we should retain them
         //
         // db_params.generate_decoys = false;
@@ -187,12 +190,16 @@ impl Runner {
                     score_type: self.parameters.score_type,
                 };
 
-                // Allocate an array of booleans indicating whether a peptide was identified in a 
+                // Allocate an array of booleans indicating whether a peptide was identified in a
                 // preliminary pass of the data
-                let keep = (0..db.peptides.len()).map(|_| std::sync::atomic::AtomicBool::new(false)).collect::<Vec<_>>();
+                let keep = (0..db.peptides.len())
+                    .map(|_| std::sync::atomic::AtomicBool::new(false))
+                    .collect::<Vec<_>>();
 
                 match &spectra {
-                    Some(spectra) => self.peptide_filter_processed_spectra(&scorer, &spectra, &keep),
+                    Some(spectra) => {
+                        self.peptide_filter_processed_spectra(&scorer, &spectra, &keep)
+                    }
                     None => self
                         .parameters
                         .mzml_paths
@@ -206,14 +213,19 @@ impl Runner {
                 };
 
                 // Retain only peptides where `keep[ix] = true`
-                let peptides = db.peptides.drain(..).enumerate().filter_map(|(ix, peptide)| {
-                    let val = keep[ix].load(std::sync::atomic::Ordering::Relaxed);
-                    if val {
-                        Some(peptide)
-                    } else {
-                        None
-                    }
-                }).collect::<Vec<_>>();
+                let peptides = db
+                    .peptides
+                    .drain(..)
+                    .enumerate()
+                    .filter_map(|(ix, peptide)| {
+                        let val = keep[ix].load(std::sync::atomic::Ordering::Relaxed);
+                        if val {
+                            Some(peptide)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>();
 
                 info!(
                     "found {} pre-filtered peptides for fasta chunk {}",
@@ -249,13 +261,21 @@ impl Runner {
                     let rate = prev * 1000 / (duration + 1);
                     log::trace!("- searched {} spectra ({} spectra/s)", prev, rate);
                 }
-                scorer.quick_score(spectrum, self.parameters.database.prefilter_low_memory, keep)
+                scorer.quick_score(
+                    spectrum,
+                    self.parameters.database.prefilter_low_memory,
+                    keep,
+                )
             });
 
         let duration = Instant::now().duration_since(start).as_millis() as usize;
         let prev = counter.load(Ordering::Relaxed);
         let rate = prev * 1000 / (duration + 1);
-        log::info!("- prefilter search:  {:8} ms ({} spectra/s)", duration, rate);
+        log::info!(
+            "- prefilter search:  {:8} ms ({} spectra/s)",
+            duration,
+            rate
+        );
     }
 
     fn spectrum_fdr(&self, features: &mut [Feature]) -> usize {
@@ -1139,7 +1159,7 @@ impl Runner {
 
     pub fn write_lfq(
         &self,
-        areas: HashMap<(PrecursorId, bool), (Peak, Vec<f64>), fnv::FnvBuildHasher>,
+        areas: HashMap<(PrecursorId, bool), PeptideQuantTrace, fnv::FnvBuildHasher>,
         filenames: &[String],
     ) -> anyhow::Result<String> {
         let path = self.make_path("lfq.tsv");
@@ -1161,12 +1181,12 @@ impl Runner {
 
         let records = areas
             .into_par_iter()
-            .filter_map(|((id, decoy), (peak, data))| {
-                if decoy {
+            .filter_map(|((_, _), trace)| {
+                if trace.decoy {
                     return None;
                 };
                 let mut record = csv::ByteRecord::new();
-                let (peptide_ix, charge) = match id {
+                let (peptide_ix, charge) = match trace.precursor {
                     PrecursorId::Combined(x) => (x, None),
                     PrecursorId::Charged((x, charge)) => (x, Some(charge as i32)),
                 };
@@ -1177,10 +1197,14 @@ impl Runner {
                         .proteins(&self.database.decoy_tag, self.database.generate_decoys)
                         .as_bytes(),
                 );
-                record.push_field(ryu::Buffer::new().format(peak.q_value).as_bytes());
-                record.push_field(ryu::Buffer::new().format(peak.score).as_bytes());
-                record.push_field(ryu::Buffer::new().format(peak.spectral_angle).as_bytes());
-                for x in data {
+                record.push_field(ryu::Buffer::new().format(trace.peak.q_value).as_bytes());
+                record.push_field(ryu::Buffer::new().format(trace.peak.score).as_bytes());
+                record.push_field(
+                    ryu::Buffer::new()
+                        .format(trace.peak.spectral_angle)
+                        .as_bytes(),
+                );
+                for x in trace.intensities {
                     record.push_field(ryu::Buffer::new().format(x).as_bytes());
                 }
                 Some(record)
@@ -1200,7 +1224,7 @@ impl Runner {
     fn write_report(
         &self,
         features: &[Feature],
-        areas: Option<HashMap<(PrecursorId, bool), (Peak, Vec<f64>), fnv::FnvBuildHasher>>,
+        areas: Option<HashMap<(PrecursorId, bool), PeptideQuantTrace, fnv::FnvBuildHasher>>,
         filenames: &[String],
     ) -> anyhow::Result<String> {
         let path = self.make_path("results.sage.report.html");
@@ -1297,9 +1321,9 @@ impl Runner {
                 let mut total_lfq_intensities = Vec::new();
                 for i in 0..filenames.len() {
                     let mut intensities = Vec::new();
-                    for ((id, decoy), (peak, data)) in areas {
-                        if !decoy && peak.q_value <= global_q_value_filter {
-                            intensities.push(data[i] as f32);
+                    for (_, trace) in areas {
+                        if !trace.decoy && trace.peak.q_value <= global_q_value_filter {
+                            intensities.push(trace.intensities[i] as f32);
                         }
                     }
                     total_lfq_intensities.push(intensities.iter().sum());
@@ -1533,9 +1557,9 @@ impl Runner {
                 let mut lfq_intensities: Vec<Vec<f64>> = Vec::new();
                 for i in 0..filenames.len() {
                     let mut intensities = Vec::new();
-                    for ((_id, decoy), (peak, data)) in &areas {
-                        if !decoy && peak.q_value <= global_q_value_filter {
-                            intensities.push(data[i].log2());
+                    for (_, trace) in &areas {
+                        if !trace.decoy && trace.peak.q_value <= global_q_value_filter {
+                            intensities.push(trace.intensities[i].log2());
                         }
                     }
                     lfq_intensities.push(intensities);

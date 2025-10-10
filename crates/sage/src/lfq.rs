@@ -36,7 +36,23 @@ pub enum IntegrationStrategy {
     Sum,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug)]
+pub struct PeptideQuantTrace {
+    pub precursor: PrecursorId,
+    pub peptide: PeptideIx,
+    pub decoy: bool,
+    pub peak: Peak,
+    pub intensities: Vec<f64>,
+    pub reference_file_id: usize,
+    pub dot_product: Matrix,
+    pub spectral_angle: Matrix,
+    pub isotope_traces: Matrix,
+    pub raw_isotope_traces: Matrix,
+    pub isotopic_distribution: [f32; N_ISOTOPES],
+    pub time_warps: Vec<isize>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PrecursorId {
     Combined(PeptideIx),
     Charged((PeptideIx, u8)),
@@ -226,7 +242,7 @@ impl FeatureMap {
         db: &IndexedDatabase,
         spectra: &MS1Spectra,
         alignments: &[Alignment],
-    ) -> HashMap<(PrecursorId, bool), (Peak, Vec<f64>), fnv::FnvBuildHasher> {
+    ) -> HashMap<(PrecursorId, bool), PeptideQuantTrace, fnv::FnvBuildHasher> {
         let scores: DashMap<(PrecursorId, bool), Grid, fnv::FnvBuildHasher> = DashMap::default();
 
         log::info!("tracing MS1 features");
@@ -303,14 +319,35 @@ impl FeatureMap {
 
         scores
             .into_par_iter()
-            .filter_map(|(peptide_ix, mut grid)| {
+            .filter_map(|(precursor_key, mut grid)| {
                 // MS1 ions have been added to any relevant grids, so we now
                 // attempt to trace the peaks, find the best peak, and integrate
                 // it across all of the files
-                let mut traces = grid.summarize_traces();
-                let (peak, data) = traces.integrate(&self.settings)?;
+                let traces = grid.summarize_traces();
+                let integrated = traces.integrate(&self.settings)?;
+                let (precursor, decoy) = precursor_key;
+                let peptide = match precursor {
+                    PrecursorId::Combined(ix) => ix,
+                    PrecursorId::Charged((ix, _)) => ix,
+                };
 
-                Some((peptide_ix, (peak, data)))
+                Some((
+                    precursor_key,
+                    PeptideQuantTrace {
+                        precursor,
+                        peptide,
+                        decoy,
+                        peak: integrated.peak,
+                        intensities: integrated.intensities,
+                        reference_file_id: integrated.reference_file_id,
+                        dot_product: integrated.dot_product,
+                        spectral_angle: integrated.spectral_angle,
+                        isotope_traces: integrated.isotope_traces,
+                        raw_isotope_traces: integrated.raw_isotope_traces,
+                        isotopic_distribution: integrated.distribution,
+                        time_warps: integrated.time_warps,
+                    },
+                ))
             })
             .collect::<HashMap<_, _, _>>()
     }
@@ -340,8 +377,27 @@ pub struct Traces {
     pub dot_product: Matrix,
     /// Matrix of spectral angles at each retention time for each file
     pub spectral_angle: Matrix,
+    /// Smoothed per-isotope traces for each file (rows = files * N_ISOTOPES)
+    pub isotope_traces: Matrix,
+    /// Raw per-isotope traces for each file prior to smoothing
+    pub raw_isotope_traces: Matrix,
     /// File with the most confident PSM
     reference_file_id: usize,
+    /// Theoretical isotopic distribution used for normalization
+    distribution: [f32; N_ISOTOPES],
+}
+
+#[derive(Clone, Debug)]
+pub struct IntegratedTraces {
+    pub peak: Peak,
+    pub intensities: Vec<f64>,
+    pub dot_product: Matrix,
+    pub spectral_angle: Matrix,
+    pub isotope_traces: Matrix,
+    pub raw_isotope_traces: Matrix,
+    pub reference_file_id: usize,
+    pub distribution: [f32; N_ISOTOPES],
+    pub time_warps: Vec<isize>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -358,10 +414,12 @@ pub struct Peak {
 
 impl Traces {
     /// Calculate and apply time warping factors
-    fn warp(&mut self) {
+    fn warp(&mut self) -> Vec<isize> {
         let time_warps = self.find_time_warps(&self.dot_product, 75);
         Self::apply_time_warps(&mut self.spectral_angle, &time_warps);
         Self::apply_time_warps(&mut self.dot_product, &time_warps);
+        Self::apply_time_warps_isotopes(&mut self.isotope_traces, &time_warps);
+        time_warps
     }
 
     /// Find time warping offsets for each file that maximize the dot product
@@ -411,6 +469,31 @@ impl Traces {
         }
     }
 
+    fn apply_time_warps_isotopes(matrix: &mut Matrix, time_warps: &[isize]) {
+        if matrix.rows == 0 {
+            return;
+        }
+
+        for (file, warp) in time_warps.iter().enumerate() {
+            for isotope in 0..N_ISOTOPES {
+                let row = file * N_ISOTOPES + isotope;
+                if row >= matrix.rows {
+                    break;
+                }
+
+                let run = matrix.row_slice_mut(row);
+                let mut shifted = vec![0.0; run.len()];
+                for (i, val) in shifted.iter_mut().enumerate() {
+                    let j = i as isize + warp;
+                    if j >= 0 && j < run.len() as isize {
+                        *val = run[j as usize];
+                    }
+                }
+                run.copy_from_slice(&shifted);
+            }
+        }
+    }
+
     pub fn scores(&self, strategy: PeakScoringStrategy) -> (Vec<f64>, Vec<f64>) {
         let mut spectral = Vec::with_capacity(self.spectral_angle.cols);
         let mut intensity = Vec::with_capacity(self.spectral_angle.cols);
@@ -456,8 +539,8 @@ impl Traces {
     ///   angle observed across all of the files
     /// * Integrate all of the MS1 traces within said window, returning a vector
     ///   of length `n_files` containing the summed MS1 intensities
-    pub fn integrate(&mut self, settings: &LfqSettings) -> Option<(Peak, Vec<f64>)> {
-        self.warp();
+    pub fn integrate(mut self, settings: &LfqSettings) -> Option<IntegratedTraces> {
+        let time_warps = self.warp();
 
         let (scores, spectral) = self.scores(settings.peak_scoring);
         let mut best = Peak::default();
@@ -517,7 +600,17 @@ impl Traces {
             summed_int += dotp;
         }
         best.spectral_angle = weighted / summed_int;
-        Some((best, areas))
+        Some(IntegratedTraces {
+            peak: best,
+            intensities: areas,
+            dot_product: self.dot_product,
+            spectral_angle: self.spectral_angle,
+            isotope_traces: self.isotope_traces,
+            raw_isotope_traces: self.raw_isotope_traces,
+            reference_file_id: self.reference_file_id,
+            distribution: self.distribution,
+            time_warps,
+        })
     }
 }
 
@@ -569,6 +662,7 @@ impl Grid {
     ///   relative to theoretical distribution
     pub fn summarize_traces(&mut self) -> Traces {
         let k = gaussian_kernel(0.5, K_WIDTH);
+        let raw_matrix = self.matrix.clone();
 
         let mut spectral_angle = Matrix::new(
             vec![0.0; self.files * self.matrix.cols],
@@ -614,10 +708,15 @@ impl Grid {
             }
         }
 
+        let isotope_traces = self.matrix.clone();
+
         Traces {
             dot_product,
             spectral_angle,
+            isotope_traces,
+            raw_isotope_traces: raw_matrix,
             reference_file_id: self.reference_file_id,
+            distribution: self.distribution,
         }
     }
 }
