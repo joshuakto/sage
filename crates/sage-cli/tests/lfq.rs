@@ -127,6 +127,7 @@ fn read_lfq_parquet(
 
         let intensity = row
             .get_double(7)
+            .or_else(|_| row.get_float(7).map(f64::from))
             .with_context(|| format!("missing intensity column in {}", parquet_path.display()))?;
 
         let run_idx = run_lookup

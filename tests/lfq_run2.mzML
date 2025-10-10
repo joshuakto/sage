@@ -4,31 +4,54 @@
     <cv id="MS" fullName="Proteomics Standards Initiative Mass Spectrometry Ontology" version="4.1.92" URI="https://raw.githubusercontent.com/HUPO-PSI/psi-ms-CV/master/psi-ms.obo"/>
   </cvList>
   <run id="run2" defaultInstrumentConfigurationRef="IC1">
-    <spectrumList count="2">
-      <spectrum index="0" id="controllerType=0 controllerNumber=1 scan=MS1_2" defaultArrayLength="3">
+    <spectrumList count="3">
+      <spectrum index="0" id="controllerType=0 controllerNumber=1 scan=MS1_2" defaultArrayLength="5">
         <cvParam cvRef="MS" accession="MS:1000511" name="ms level" value="1"/>
         <cvParam cvRef="MS" accession="MS:1000127" name="centroid spectrum" value=""/>
         <scanList count="1">
           <scan>
-            <cvParam cvRef="MS" accession="MS:1000016" name="scan start time" value="0.6" unitAccession="UO:0000031" unitName="minute"/>
+            <cvParam cvRef="MS" accession="MS:1000016" name="scan start time" value="0.51" unitAccession="UO:0000031" unitName="minute"/>
           </scan>
         </scanList>
         <binaryDataArrayList count="2">
-          <binaryDataArray encodedLength="16" arrayLength="3">
+          <binaryDataArray encodedLength="28" arrayLength="5">
             <cvParam cvRef="MS" accession="MS:1000514" name="m/z array" value=""/>
             <cvParam cvRef="MS" accession="MS:1000576" name="no compression" value=""/>
             <cvParam cvRef="MS" accession="MS:1000521" name="32-bit float" value=""/>
-            <binary>fUPxQyvCIEQGA3FE</binary>
+            <binary>AADIQyvCIEST1yBE++wgRAAAYUQ=</binary>
           </binaryDataArray>
-          <binaryDataArray encodedLength="16" arrayLength="3">
+          <binaryDataArray encodedLength="28" arrayLength="5">
             <cvParam cvRef="MS" accession="MS:1000515" name="intensity array" value=""/>
             <cvParam cvRef="MS" accession="MS:1000576" name="no compression" value=""/>
             <cvParam cvRef="MS" accession="MS:1000521" name="32-bit float" value=""/>
-            <binary>ACR0SgAbt0qAn9VK</binary>
+            <binary>AGDqR8Dh5EoAGzdKAHySSQBgakc=</binary>
           </binaryDataArray>
         </binaryDataArrayList>
       </spectrum>
-      <spectrum index="1" id="controllerType=0 controllerNumber=1 scan=MS2_2" defaultArrayLength="16">
+      <spectrum index="1" id="controllerType=0 controllerNumber=1 scan=MS1_2b" defaultArrayLength="5">
+        <cvParam cvRef="MS" accession="MS:1000511" name="ms level" value="1"/>
+        <cvParam cvRef="MS" accession="MS:1000127" name="centroid spectrum" value=""/>
+        <scanList count="1">
+          <scan>
+            <cvParam cvRef="MS" accession="MS:1000016" name="scan start time" value="0.515" unitAccession="UO:0000031" unitName="minute"/>
+          </scan>
+        </scanList>
+        <binaryDataArrayList count="2">
+          <binaryDataArray encodedLength="28" arrayLength="5">
+            <cvParam cvRef="MS" accession="MS:1000514" name="m/z array" value=""/>
+            <cvParam cvRef="MS" accession="MS:1000576" name="no compression" value=""/>
+            <cvParam cvRef="MS" accession="MS:1000521" name="32-bit float" value=""/>
+            <binary>AADIQyvCIEST1yBE++wgRAAAYUQ=</binary>
+          </binaryDataArray>
+          <binaryDataArray encodedLength="28" arrayLength="5">
+            <cvParam cvRef="MS" accession="MS:1000515" name="intensity array" value=""/>
+            <cvParam cvRef="MS" accession="MS:1000576" name="no compression" value=""/>
+            <cvParam cvRef="MS" accession="MS:1000521" name="32-bit float" value=""/>
+            <binary>ANjWRwCFz0qAyyRKACR0SQDYVkc=</binary>
+          </binaryDataArray>
+        </binaryDataArrayList>
+      </spectrum>
+      <spectrum index="2" id="controllerType=0 controllerNumber=1 scan=MS2_2" defaultArrayLength="16">
         <cvParam cvRef="MS" accession="MS:1000511" name="ms level" value="2"/>
         <cvParam cvRef="MS" accession="MS:1000127" name="centroid spectrum" value=""/>
         <precursorList count="1">
@@ -44,7 +67,7 @@
         </precursorList>
         <scanList count="1">
           <scan>
-            <cvParam cvRef="MS" accession="MS:1000016" name="scan start time" value="0.61" unitAccession="UO:0000031" unitName="minute"/>
+            <cvParam cvRef="MS" accession="MS:1000016" name="scan start time" value="0.51" unitAccession="UO:0000031" unitName="minute"/>
           </scan>
         </scanList>
         <binaryDataArrayList count="2">

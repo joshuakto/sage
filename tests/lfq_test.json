@@ -3,5 +3,22 @@
     "lfq_run1.mzML",
     "lfq_run2.mzML"
   ],
-  "observations": []
+  "observations": [
+    {
+      "scannr": 1,
+      "charge": 3,
+      "mass": 642.0266,
+      "intensity": 7041995.529108103,
+      "isotope": 0,
+      "rt": 0.51
+    },
+    {
+      "scannr": 2,
+      "charge": 3,
+      "mass": 642.0266,
+      "intensity": 10562993.480569365,
+      "isotope": 0,
+      "rt": 0.51
+    }
+  ]
 }
