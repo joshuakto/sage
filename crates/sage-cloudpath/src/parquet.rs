@@ -21,7 +21,7 @@ use parquet::{
 };
 use sage_core::database::IndexedDatabase;
 use sage_core::ion_series::Kind;
-use sage_core::lfq::{Peak, PrecursorId};
+use sage_core::lfq::{PeptideQuantTrace, PrecursorId};
 use sage_core::scoring::Feature;
 use sage_core::tmt::TmtQuant;
 
@@ -419,7 +419,7 @@ pub fn build_lfq_schema() -> parquet::errors::Result<Type> {
 }
 
 pub fn serialize_lfq<H: BuildHasher>(
-    areas: &HashMap<(PrecursorId, bool), (Peak, Vec<f64>), H>,
+    areas: &HashMap<(PrecursorId, bool), PeptideQuantTrace, H>,
     filenames: &[String],
     database: &IndexedDatabase,
 ) -> parquet::errors::Result<Vec<u8>> {
@@ -436,11 +436,8 @@ pub fn serialize_lfq<H: BuildHasher>(
     if let Some(mut col) = rg.next_column()? {
         let values = areas
             .iter()
-            .flat_map(|((id, _), _)| {
-                let peptide_idx = match id {
-                    PrecursorId::Combined(x) | PrecursorId::Charged((x, _)) => x,
-                };
-                let val = database[*peptide_idx].to_string().as_bytes().into();
+            .flat_map(|(_, trace)| {
+                let val = database[trace.peptide].to_string().as_bytes().into();
                 std::iter::repeat(val).take(filenames.len())
             })
             .collect::<Vec<_>>();
@@ -453,11 +450,8 @@ pub fn serialize_lfq<H: BuildHasher>(
     if let Some(mut col) = rg.next_column()? {
         let values = areas
             .iter()
-            .flat_map(|((id, _), _)| {
-                let peptide_idx = match id {
-                    PrecursorId::Combined(x) | PrecursorId::Charged((x, _)) => x,
-                };
-                let val = database[*peptide_idx].sequence.as_ref().into();
+            .flat_map(|(_, trace)| {
+                let val = database[trace.peptide].sequence.as_ref().into();
                 std::iter::repeat(val).take(filenames.len())
             })
             .collect::<Vec<_>>();
@@ -471,13 +465,13 @@ pub fn serialize_lfq<H: BuildHasher>(
         let mut values = Vec::with_capacity(areas.len() * filenames.len());
         let mut def_levels = Vec::with_capacity(areas.len() * filenames.len());
 
-        for ((id, _), _) in areas.iter() {
-            match id {
+        for (_, trace) in areas.iter() {
+            match trace.precursor {
                 PrecursorId::Combined(_) => {
                     def_levels.extend(std::iter::repeat(0).take(filenames.len()));
                 }
                 PrecursorId::Charged((_, charge)) => {
-                    values.extend(std::iter::repeat(*charge as i32).take(filenames.len()));
+                    values.extend(std::iter::repeat(charge as i32).take(filenames.len()));
                     def_levels.extend(std::iter::repeat(1).take(filenames.len()));
                 }
             }
@@ -491,11 +485,8 @@ pub fn serialize_lfq<H: BuildHasher>(
     if let Some(mut col) = rg.next_column()? {
         let values = areas
             .iter()
-            .flat_map(|((id, _), _)| {
-                let peptide_idx = match id {
-                    PrecursorId::Combined(x) | PrecursorId::Charged((x, _)) => x,
-                };
-                let val = database[*peptide_idx]
+            .flat_map(|(_, trace)| {
+                let val = database[trace.peptide]
                     .proteins(&database.decoy_tag, database.generate_decoys)
                     .as_str()
                     .into();
@@ -511,7 +502,7 @@ pub fn serialize_lfq<H: BuildHasher>(
     if let Some(mut col) = rg.next_column()? {
         let values = areas
             .iter()
-            .flat_map(|((_, decoy), _)| std::iter::repeat(*decoy).take(filenames.len()))
+            .flat_map(|(_, trace)| std::iter::repeat(trace.decoy).take(filenames.len()))
             .collect::<Vec<_>>();
 
         col.typed::<BoolType>().write_batch(&values, None, None)?;
@@ -521,7 +512,7 @@ pub fn serialize_lfq<H: BuildHasher>(
     if let Some(mut col) = rg.next_column()? {
         let values = areas
             .iter()
-            .flat_map(|(_, (peak, _))| std::iter::repeat(peak.q_value).take(filenames.len()))
+            .flat_map(|(_, trace)| std::iter::repeat(trace.peak.q_value).take(filenames.len()))
             .collect::<Vec<_>>();
 
         col.typed::<FloatType>().write_batch(&values, None, None)?;
@@ -531,8 +522,8 @@ pub fn serialize_lfq<H: BuildHasher>(
     if let Some(mut col) = rg.next_column()? {
         let values = areas
             .iter()
-            .flat_map(|(_, (_, values))| {
-                (0..values.len()).map(|idx| filenames[idx].as_bytes().into())
+            .flat_map(|(_, trace)| {
+                (0..trace.intensities.len()).map(|idx| filenames[idx].as_bytes().into())
             })
             .collect::<Vec<_>>();
 
@@ -545,7 +536,7 @@ pub fn serialize_lfq<H: BuildHasher>(
     if let Some(mut col) = rg.next_column()? {
         let values = areas
             .iter()
-            .flat_map(|(_, (_, values))| values.iter().copied().map(|v| v as f32))
+            .flat_map(|(_, trace)| trace.intensities.iter().copied().map(|v| v as f32))
             .collect::<Vec<_>>();
 
         col.typed::<FloatType>().write_batch(&values, None, None)?;
