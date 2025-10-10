@@ -546,3 +546,294 @@ pub fn serialize_lfq<H: BuildHasher>(
     rg.close()?;
     writer.into_inner()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use fnv::FnvHasher;
+    use parquet::column::reader::ColumnReader;
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    use parquet::record::{Field, RowAccessor};
+    use sage_core::database::PeptideIx;
+    use sage_core::enzyme::Position;
+    use sage_core::lfq::Peak;
+    use sage_core::ml::matrix::Matrix;
+    use sage_core::peptide::Peptide;
+    use std::hash::BuildHasherDefault;
+    use std::sync::Arc;
+
+    fn make_peptide(sequence: &str, proteins: &[&str], decoy: bool) -> Peptide {
+        Peptide {
+            decoy,
+            sequence: Arc::from(sequence.as_bytes()),
+            modifications: vec![0.0; sequence.len()],
+            nterm: None,
+            cterm: None,
+            monoisotopic: 0.0,
+            missed_cleavages: 0,
+            semi_enzymatic: false,
+            position: Position::Full,
+            proteins: proteins
+                .iter()
+                .map(|protein| Arc::<str>::from(*protein))
+                .collect(),
+        }
+    }
+
+    fn make_trace(
+        precursor: PrecursorId,
+        peptide: PeptideIx,
+        decoy: bool,
+        q_value: f32,
+        intensities: Vec<f64>,
+    ) -> PeptideQuantTrace {
+        PeptideQuantTrace {
+            precursor,
+            peptide,
+            decoy,
+            peak: Peak {
+                rt: 10,
+                spectral_angle: 0.0,
+                score: 0.0,
+                q_value,
+            },
+            intensities,
+            reference_file_id: 0,
+            dot_product: Matrix::zeros(0, 0),
+            spectral_angle: Matrix::zeros(0, 0),
+            isotope_traces: Matrix::zeros(0, 0),
+            raw_isotope_traces: Matrix::zeros(0, 0),
+            isotopic_distribution: [0.0; 3],
+            time_warps: Vec::new(),
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct ExpectedRow {
+        peptide: String,
+        stripped: String,
+        precursor: PrecursorId,
+        filename: String,
+        intensity: f32,
+    }
+
+    #[test]
+    fn serialize_lfq_optional_charge_levels() -> parquet::errors::Result<()> {
+        let filenames = vec!["run_a".to_string(), "run_b".to_string()];
+
+        let peptides = vec![
+            make_peptide("PEPTIDEK", &["PROT1"], false),
+            make_peptide("PEPTIDER", &["PROT2"], false),
+        ];
+
+        let database = IndexedDatabase {
+            peptides,
+            fragments: Vec::new(),
+            ion_kinds: Vec::new(),
+            min_value: Vec::new(),
+            potential_mods: Vec::new(),
+            bucket_size: 1,
+            generate_decoys: false,
+            decoy_tag: "rev_".into(),
+        };
+
+        let combined_precursor = PrecursorId::Combined(PeptideIx(0));
+        let charged_precursor = PrecursorId::Charged((PeptideIx(1), 3));
+
+        let mut areas: HashMap<_, _, BuildHasherDefault<FnvHasher>> = HashMap::default();
+        areas.insert(
+            (combined_precursor, false),
+            make_trace(
+                combined_precursor,
+                PeptideIx(0),
+                false,
+                0.01,
+                vec![111.25, 222.5],
+            ),
+        );
+        areas.insert(
+            (charged_precursor, false),
+            make_trace(
+                charged_precursor,
+                PeptideIx(1),
+                false,
+                0.02,
+                vec![333.75, 444.5],
+            ),
+        );
+
+        let expected_rows: Vec<ExpectedRow> = areas
+            .iter()
+            .flat_map(|((precursor, _), trace)| {
+                let peptide = database[trace.peptide].to_string();
+                let stripped = std::str::from_utf8(&database[trace.peptide].sequence)
+                    .unwrap()
+                    .to_owned();
+                filenames.iter().zip(trace.intensities.iter()).map(move |(file, intensity)| {
+                    ExpectedRow {
+                        peptide: peptide.clone(),
+                        stripped: stripped.clone(),
+                        precursor: *precursor,
+                        filename: file.clone(),
+                        intensity: *intensity as f32,
+                    }
+                })
+            })
+            .collect();
+
+        let parquet_buffer = serialize_lfq(&areas, &filenames, &database)?;
+
+        let reader = SerializedFileReader::new(Bytes::from(parquet_buffer))?;
+        let actual_rows = reader
+            .get_row_iter(None)?
+            .collect::<parquet::errors::Result<Vec<_>>>()?;
+
+        assert_eq!(actual_rows.len(), expected_rows.len());
+
+        for (expected, row) in expected_rows.iter().zip(actual_rows.iter()) {
+            assert_eq!(row.get_string(0)?, &expected.peptide);
+            assert_eq!(row.get_string(1)?, &expected.stripped);
+
+            let charge_field = row
+                .get_column_iter()
+                .nth(2)
+                .expect("charge column present")
+                .1;
+            match expected.precursor {
+                PrecursorId::Combined(_) => {
+                    assert!(matches!(charge_field, Field::Null));
+                }
+                PrecursorId::Charged((_, charge)) => {
+                    assert!(matches!(charge_field, Field::Int(value) if *value == charge as i32));
+                }
+            }
+
+            assert_eq!(row.get_string(6)?, &expected.filename);
+            let intensity = row.get_float(7)?;
+            assert!(intensity > 0.0, "intensity should retain magnitude");
+            assert!((intensity - expected.intensity).abs() < 1e-4);
+        }
+
+        let row_group = reader.get_row_group(0)?;
+        let num_rows = row_group.metadata().num_rows() as usize;
+        assert_eq!(num_rows, expected_rows.len());
+
+        if let ColumnReader::Int32ColumnReader(mut charge_reader) = row_group.get_column_reader(2)? {
+            let mut def_levels = Vec::with_capacity(num_rows);
+            let mut charge_values = Vec::with_capacity(num_rows);
+            let mut def_batch = Vec::with_capacity(num_rows);
+            let mut value_batch = Vec::with_capacity(num_rows);
+
+            while def_levels.len() < num_rows {
+                def_batch.clear();
+                value_batch.clear();
+                let (batch_values, batch_levels) = charge_reader.read_batch(
+                    num_rows - def_levels.len(),
+                    Some(&mut def_batch),
+                    None,
+                    &mut value_batch,
+                )?;
+
+                assert!(batch_levels > 0, "no definition levels read");
+                def_levels.extend_from_slice(&def_batch[..batch_levels]);
+                charge_values.extend_from_slice(&value_batch[..batch_values]);
+            }
+
+            assert_eq!(def_levels.len(), num_rows);
+
+            let mut extracted = Vec::with_capacity(num_rows);
+            let mut value_idx = 0;
+            for level in def_levels.into_iter() {
+                if level == 0 {
+                    extracted.push(None);
+                } else {
+                    extracted.push(Some(charge_values[value_idx]));
+                    value_idx += 1;
+                }
+            }
+
+            assert_eq!(value_idx, charge_values.len());
+
+            let expected_charge: Vec<Option<i32>> = expected_rows
+                .iter()
+                .map(|row| match row.precursor {
+                    PrecursorId::Combined(_) => None,
+                    PrecursorId::Charged((_, charge)) => Some(charge as i32),
+                })
+                .collect();
+
+            assert_eq!(extracted, expected_charge);
+        } else {
+            panic!("charge column reader not available");
+        }
+
+        if let ColumnReader::ByteArrayColumnReader(mut filename_reader) =
+            row_group.get_column_reader(6)?
+        {
+            let mut filename_values = Vec::with_capacity(num_rows);
+            let mut filename_batch = Vec::with_capacity(num_rows);
+            let mut levels_read = 0usize;
+
+            while levels_read < num_rows {
+                filename_batch.clear();
+                let (batch_values, batch_levels) = filename_reader.read_batch(
+                    num_rows - levels_read,
+                    None,
+                    None,
+                    &mut filename_batch,
+                )?;
+
+                assert!(batch_levels > 0, "no filenames read");
+                levels_read += batch_levels;
+                filename_values.extend(filename_batch.drain(0..batch_values));
+            }
+
+            assert_eq!(levels_read, num_rows);
+
+            let filenames_from_column: Vec<String> = filename_values
+                .into_iter()
+                .map(|ba| std::str::from_utf8(ba.data()).unwrap().to_owned())
+                .collect();
+
+            for (expected, actual) in expected_rows.iter().zip(filenames_from_column.iter()) {
+                assert_eq!(actual, &expected.filename);
+            }
+        } else {
+            panic!("filename column reader not available");
+        }
+
+        if let ColumnReader::FloatColumnReader(mut intensity_reader) =
+            row_group.get_column_reader(7)?
+        {
+            let mut intensity_values = Vec::with_capacity(num_rows);
+            let mut intensity_batch = Vec::with_capacity(num_rows);
+            let mut levels_read = 0usize;
+
+            while levels_read < num_rows {
+                intensity_batch.clear();
+                let (batch_values, batch_levels) = intensity_reader.read_batch(
+                    num_rows - levels_read,
+                    None,
+                    None,
+                    &mut intensity_batch,
+                )?;
+
+                assert!(batch_levels > 0, "no intensities read");
+                levels_read += batch_levels;
+                intensity_values.extend_from_slice(&intensity_batch[..batch_values]);
+            }
+
+            assert_eq!(levels_read, num_rows);
+
+            for (expected, actual) in expected_rows.iter().zip(intensity_values.iter()) {
+                assert!((*actual - expected.intensity).abs() < 1e-4);
+                assert!(*actual > 0.0);
+            }
+        } else {
+            panic!("intensity column reader not available");
+        }
+
+        Ok(())
+    }
+}
