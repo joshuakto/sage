@@ -567,8 +567,12 @@ impl Runner {
                     &outputs.features,
                 )
                 .quantify(&self.database, &outputs.ms1, &alignments);
+                log::trace!("quantified {} precursor traces", areas.len());
 
-                let q_precursor = sage_core::fdr::picked_precursor(&mut areas);
+                let q_precursor = sage_core::fdr::picked_precursor(
+                    &mut areas,
+                    self.parameters.quant.lfq_settings.max_precursor_q,
+                );
 
                 log::info!("discovered {} target MS1 peaks at 5% FDR", q_precursor);
                 Some(areas)

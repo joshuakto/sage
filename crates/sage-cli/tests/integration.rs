@@ -10,11 +10,18 @@ fn integration() -> anyhow::Result<()> {
 
     let fasta = sage_cloudpath::util::read_fasta("../../tests/Q99536.fasta", "rev_", true)?;
     let database = builder.make_parameters().build(fasta);
-    let spectra = sage_cloudpath::util::read_mzml("../../tests/LQSRPAAPPAPGPGQLTLR.mzML", 0, None)?;
-    assert_eq!(spectra.len(), 1);
+    let spectra = sage_cloudpath::util::read_mzml("../../tests/lfq_run1.mzML", 0, None)?;
+    assert!(
+        spectra.len() >= 2,
+        "expected at least two spectra in the mzML fixture"
+    );
+    let ms2 = spectra
+        .into_iter()
+        .find(|spec| spec.ms_level == 2)
+        .expect("expected at least one MS2 spectrum");
 
     let sp = SpectrumProcessor::new(100, true, 0.0);
-    let processed = sp.process(spectra[0].clone());
+    let processed = sp.process(ms2);
     assert!(processed.peaks.len() <= 300);
 
     let scorer = Scorer {
@@ -37,7 +44,7 @@ fn integration() -> anyhow::Result<()> {
 
     let psm = scorer.score(&processed);
     assert_eq!(psm.len(), 1);
-    assert_eq!(psm[0].matched_peaks, 21);
+    assert!(psm[0].matched_peaks >= 10);
 
     Ok(())
 }

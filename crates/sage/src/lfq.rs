@@ -66,6 +66,8 @@ pub struct LfqSettings {
     pub ppm_tolerance: f32,
     pub mobility_pct_tolerance: f32,
     pub combine_charge_states: bool,
+    pub min_peptide_q: f32,
+    pub max_precursor_q: f32,
 }
 
 impl Default for LfqSettings {
@@ -77,6 +79,8 @@ impl Default for LfqSettings {
             ppm_tolerance: 5.0,
             mobility_pct_tolerance: 1.0,
             combine_charge_states: true,
+            min_peptide_q: 0.01,
+            max_precursor_q: 0.05,
         }
     }
 }
@@ -113,7 +117,7 @@ pub fn build_feature_map(
     let map: DashMap<PeptideIx, PrecursorRange, fnv::FnvBuildHasher> = DashMap::default();
     features
         .iter()
-        .filter(|feat| feat.peptide_q <= 0.01 && feat.label == 1)
+        .filter(|feat| feat.peptide_q <= settings.min_peptide_q && feat.label == 1)
         .for_each(|feat| {
             // `features` is sorted by confidence, so just take the first entry
             if !map.contains_key(&feat.peptide_idx) {
