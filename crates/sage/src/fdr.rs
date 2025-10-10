@@ -180,7 +180,10 @@ pub fn picked_protein(db: &IndexedDatabase, features: &mut [Feature]) -> usize {
     passing
 }
 
-pub fn picked_precursor(peaks: &mut FnvHashMap<(PrecursorId, bool), PeptideQuantTrace>) -> usize {
+pub fn picked_precursor(
+    peaks: &mut FnvHashMap<(PrecursorId, bool), PeptideQuantTrace>,
+    threshold: f32,
+) -> usize {
     // let mut map: FnvHashMap<PeptideIx, Competition<(PeptideIx, bool)>> = FnvHashMap::default();
     // for (key, (peak, _)) in peaks.iter() {
     //     let entry = map.entry(key.0).or_default();
@@ -223,7 +226,7 @@ pub fn picked_precursor(peaks: &mut FnvHashMap<(PrecursorId, bool), PeptideQuant
     for score in scores.iter_mut().rev() {
         q_min = q_min.min(score.q);
         score.q = q_min;
-        if q_min <= 0.05 && !score.decoy {
+        if q_min <= threshold && !score.decoy {
             passing += 1;
         }
     }

@@ -36,7 +36,8 @@
         3
     ],
     "mzml_paths": [
-        "tests/LQSRPAAPPAPGPGQLTLR.mzML"
+        "tests/lfq_run1.mzML",
+        "tests/lfq_run2.mzML"
     ],
     "score_type": "SageHyperScore"
 }

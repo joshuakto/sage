@@ -86,6 +86,8 @@ pub struct LfqOptions {
     pub ppm_tolerance: Option<f32>,
     pub mobility_pct_tolerance: Option<f32>,
     pub combine_charge_states: Option<bool>,
+    pub min_peptide_q: Option<f32>,
+    pub max_precursor_q: Option<f32>,
 }
 
 impl From<LfqOptions> for LfqSettings {
@@ -102,6 +104,14 @@ impl From<LfqOptions> for LfqSettings {
             combine_charge_states: value
                 .combine_charge_states
                 .unwrap_or(default.combine_charge_states),
+            min_peptide_q: value
+                .min_peptide_q
+                .unwrap_or(default.min_peptide_q)
+                .clamp(0.0, 1.0),
+            max_precursor_q: value
+                .max_precursor_q
+                .unwrap_or(default.max_precursor_q)
+                .clamp(0.0, 1.0),
         };
         if settings.ppm_tolerance > 20.0 {
             log::warn!("lfq_settings.ppm_tolerance is higher than expected");
