@@ -760,6 +760,95 @@ fn convolve(slice: &[f64], kernel: &[f64]) -> Vec<f64> {
         .collect()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_test_grid() -> Grid {
+        let entry = PrecursorRange {
+            rt: 50.0,
+            mass_lo: 500.0,
+            mass_hi: 505.0,
+            mobility_lo: 0.0,
+            mobility_hi: 1.0,
+            charge: 2,
+            isotope: 0,
+            peptide: PeptideIx::default(),
+            file_id: 0,
+            decoy: false,
+        };
+
+        let mut grid = Grid::new(&entry, 0.5, [0.6, 0.3, 0.1], 2, 12);
+
+        let rows: [[f64; 12]; N_ISOTOPES * 2] = [
+            [0.0, 0.0, 10.0, 5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 5.0, 2.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 2.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 10.0, 5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 5.0, 2.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 2.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ];
+
+        let mut data = Vec::new();
+        for row in &rows {
+            data.extend_from_slice(row);
+        }
+
+        grid.matrix = Matrix::new(data, grid.files * N_ISOTOPES, grid.matrix.cols);
+        grid
+    }
+
+    fn run_integration(strategy: IntegrationStrategy) {
+        let mut grid = build_test_grid();
+        let expected_raw = grid.matrix.clone();
+
+        let traces = grid.summarize_traces();
+        let raw_from_traces = traces.raw_isotope_traces.clone();
+
+        let mut settings = LfqSettings::default();
+        settings.spectral_angle = 0.0;
+        settings.integration = strategy;
+
+        let integrated = traces
+            .integrate(&settings)
+            .expect("expected integration to succeed");
+
+        assert_eq!(integrated.raw_isotope_traces, expected_raw);
+        assert_eq!(raw_from_traces, expected_raw);
+
+        assert_eq!(integrated.time_warps.len(), 2);
+        assert_eq!(integrated.reference_file_id, 0);
+
+        // The smoothed / warped data should differ from the raw matrix.
+        let changed_bins = integrated
+            .isotope_traces
+            .data
+            .iter()
+            .copied()
+            .zip(expected_raw.data.iter().copied())
+            .filter(|(smoothed, raw)| (smoothed - raw).abs() > 1e-6)
+            .count();
+        assert!(
+            changed_bins > 0,
+            "expected smoothed traces to differ from raw data"
+        );
+
+        // Gaussian smoothing should bleed intensity into neighbouring bins for the reference run.
+        assert!(integrated.isotope_traces[(0, 1)] > 0.0);
+        assert_eq!(expected_raw[(0, 1)], 0.0);
+    }
+
+    #[test]
+    fn integration_preserves_metadata_for_sum() {
+        run_integration(IntegrationStrategy::Sum);
+    }
+
+    #[test]
+    fn integration_preserves_metadata_for_apex() {
+        run_integration(IntegrationStrategy::Apex);
+    }
+}
+
 impl Query<'_> {
     pub fn mass_lookup(&self, mass: f32) -> impl Iterator<Item = &PrecursorRange> {
         (self.page_lo..self.page_hi).flat_map(move |page| {
