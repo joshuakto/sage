@@ -632,7 +632,7 @@ impl Runner {
                     .output_paths
                     .push(self.write_tmt(&outputs.quant, &filenames)?);
             }
-            if let Some(areas) = areas.clone() {
+            if let Some(areas) = areas.as_ref() {
                 self.parameters
                     .output_paths
                     .push(self.write_lfq(areas, &filenames)?);
@@ -1159,7 +1159,7 @@ impl Runner {
 
     pub fn write_lfq(
         &self,
-        areas: HashMap<(PrecursorId, bool), PeptideQuantTrace, fnv::FnvBuildHasher>,
+        areas: &HashMap<(PrecursorId, bool), PeptideQuantTrace, fnv::FnvBuildHasher>,
         filenames: &[String],
     ) -> anyhow::Result<String> {
         let path = self.make_path("lfq.tsv");
@@ -1180,8 +1180,8 @@ impl Runner {
         wtr.write_byte_record(&headers)?;
 
         let records = areas
-            .into_par_iter()
-            .filter_map(|((_, _), trace)| {
+            .par_iter()
+            .filter_map(|(_, trace)| {
                 if trace.decoy {
                     return None;
                 };
@@ -1204,7 +1204,7 @@ impl Runner {
                         .format(trace.peak.spectral_angle)
                         .as_bytes(),
                 );
-                for x in trace.intensities {
+                for &x in trace.intensities.iter() {
                     record.push_field(ryu::Buffer::new().format(x).as_bytes());
                 }
                 Some(record)
