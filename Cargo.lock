@@ -2729,6 +2729,7 @@ dependencies = [
  "aws-sdk-s3",
  "base64 0.13.1",
  "bytes",
+ "fnv",
  "futures",
  "http",
  "log",
