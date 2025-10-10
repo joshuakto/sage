@@ -796,3 +796,7 @@ impl Query<'_> {
         })
     }
 }
+
+#[cfg(all(test, feature = "protein-quant-prototype"))]
+mod protein_tests;
+
