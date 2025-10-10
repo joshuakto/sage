@@ -21,7 +21,7 @@ use parquet::{
 };
 use sage_core::database::IndexedDatabase;
 use sage_core::ion_series::Kind;
-use sage_core::lfq::{Peak, PrecursorId};
+use sage_core::lfq::{PeptideQuantTrace, PrecursorId};
 use sage_core::scoring::Feature;
 use sage_core::tmt::TmtQuant;
 
@@ -419,7 +419,7 @@ pub fn build_lfq_schema() -> parquet::errors::Result<Type> {
 }
 
 pub fn serialize_lfq<H: BuildHasher>(
-    areas: &HashMap<(PrecursorId, bool), (Peak, Vec<f64>), H>,
+    areas: &HashMap<(PrecursorId, bool), PeptideQuantTrace, H>,
     filenames: &[String],
     database: &IndexedDatabase,
 ) -> parquet::errors::Result<Vec<u8>> {
@@ -521,7 +521,7 @@ pub fn serialize_lfq<H: BuildHasher>(
     if let Some(mut col) = rg.next_column()? {
         let values = areas
             .iter()
-            .flat_map(|(_, (peak, _))| std::iter::repeat(peak.q_value).take(filenames.len()))
+            .flat_map(|(_, trace)| std::iter::repeat(trace.peak.q_value).take(filenames.len()))
             .collect::<Vec<_>>();
 
         col.typed::<FloatType>().write_batch(&values, None, None)?;
@@ -531,8 +531,8 @@ pub fn serialize_lfq<H: BuildHasher>(
     if let Some(mut col) = rg.next_column()? {
         let values = areas
             .iter()
-            .flat_map(|(_, (_, values))| {
-                (0..values.len()).map(|idx| filenames[idx].as_bytes().into())
+            .flat_map(|(_, trace)| {
+                (0..trace.intensities.len()).map(|idx| filenames[idx].as_bytes().into())
             })
             .collect::<Vec<_>>();
 
@@ -545,7 +545,7 @@ pub fn serialize_lfq<H: BuildHasher>(
     if let Some(mut col) = rg.next_column()? {
         let values = areas
             .iter()
-            .flat_map(|(_, (_, values))| values.iter().copied().map(|v| v as f32))
+            .flat_map(|(_, trace)| trace.intensities.iter().copied().map(|v| v as f32))
             .collect::<Vec<_>>();
 
         col.typed::<FloatType>().write_batch(&values, None, None)?;

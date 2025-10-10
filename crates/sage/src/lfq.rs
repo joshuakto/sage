@@ -36,7 +36,7 @@ pub enum IntegrationStrategy {
     Sum,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PrecursorId {
     Combined(PeptideIx),
     Charged((PeptideIx, u8)),
@@ -226,7 +226,7 @@ impl FeatureMap {
         db: &IndexedDatabase,
         spectra: &MS1Spectra,
         alignments: &[Alignment],
-    ) -> HashMap<(PrecursorId, bool), (Peak, Vec<f64>), fnv::FnvBuildHasher> {
+    ) -> HashMap<(PrecursorId, bool), PeptideQuantTrace, fnv::FnvBuildHasher> {
         let scores: DashMap<(PrecursorId, bool), Grid, fnv::FnvBuildHasher> = DashMap::default();
 
         log::info!("tracing MS1 features");
@@ -310,7 +310,23 @@ impl FeatureMap {
                 let mut traces = grid.summarize_traces();
                 let (peak, data) = traces.integrate(&self.settings)?;
 
-                Some((peptide_ix, (peak, data)))
+                let peptide_ix_only = match peptide_ix.0 {
+                    PrecursorId::Combined(ix) => ix,
+                    PrecursorId::Charged((ix, _)) => ix,
+                };
+
+                Some((
+                    peptide_ix,
+                    PeptideQuantTrace {
+                        precursor: peptide_ix.0,
+                        peptide_ix: peptide_ix_only,
+                        decoy: peptide_ix.1,
+                        peak,
+                        intensities: data,
+                        trace: traces.isotope_traces.clone(),
+                        reference_file_id: traces.reference_file_id,
+                    },
+                ))
             })
             .collect::<HashMap<_, _, _>>()
     }
@@ -340,8 +356,21 @@ pub struct Traces {
     pub dot_product: Matrix,
     /// Matrix of spectral angles at each retention time for each file
     pub spectral_angle: Matrix,
+    /// Smoothed per-isotope intensity traces used to build MaxLFQ graphs and other aggregations
+    pub isotope_traces: Matrix,
     /// File with the most confident PSM
     reference_file_id: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct PeptideQuantTrace {
+    pub precursor: PrecursorId,
+    pub peptide_ix: PeptideIx,
+    pub decoy: bool,
+    pub peak: Peak,
+    pub intensities: Vec<f64>,
+    pub trace: Matrix,
+    pub reference_file_id: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -617,6 +646,7 @@ impl Grid {
         Traces {
             dot_product,
             spectral_angle,
+            isotope_traces: self.matrix.clone(),
             reference_file_id: self.reference_file_id,
         }
     }
