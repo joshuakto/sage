@@ -1,5 +1,10 @@
 # Progress
 
+## 2025-02-21
+- Captured current regression coverage showing `PeptideQuantTrace` is exercised through unit tests in `crates/sage/tests/lfq.rs` and `crates/sage/tests/integration.rs`, CLI end-to-end verification in `crates/sage-cli/tests/lfq.rs`, and parquet serialization round-trips in `crates/sage-cloudpath/src/parquet.rs`, giving us confidence that trace data is consistent across core, CLI, and parquet layers.
+- Highlighted that `crates/sage/src/lfq/protein_tests.rs` hosts the ignored acceptance tests for `ProteinQuantTrace::group_by_accession`, which align with Milestone Step 2 and will define our readiness for protein-level aggregation once the helper ships.
+- Reaffirmed our roadmap: Step 2 (grouping helper) through Step 5 (documentation/tests) remain to unlock a fully featured, well-tested protein quantification module; clearing the ignored acceptance tests is the next gating task before progressing to downstream milestones.
+
 ## 2025-02-14
 - Completed Plan Step 1: Added the `PeptideQuantTrace` struct in `lfq.rs` to retain peptide identifiers, decoy flags, MaxLFQ trace matrices, and per-run intensities returned from `FeatureMap::quantify`.
 - Updated FDR assignment, CLI writers, and parquet serialization to consume the richer LFQ traces while keeping existing TSV output semantics intact.
@@ -12,8 +17,8 @@
 
 2. **Step 2 – Protein grouping helper** — ⏳ Pending
    - Finalize the `ProteinQuantTrace` data model that aggregates multiple `PeptideQuantTrace` entries per protein group.
-   - Implement grouping helpers in `lfq.rs` that respect decoy flags and propagate quality metrics.
-   - Validate grouping behavior against representative LFQ runs and document any edge-case heuristics.
+   - Implement the `ProteinQuantTrace::group_by_accession` helper so the acceptance tests in `crates/sage/src/lfq/protein_tests.rs` can be un-ignored and confirm grouping semantics across targets, decoys, and q-value filtering.
+   - Validate grouping behavior against representative LFQ runs, documenting any heuristics uncovered while enabling those tests.
 
 3. **Step 3 – CLI outputs** — ⏳ Pending
    - Extend the CLI writers to emit protein-level LFQ summaries alongside existing peptide tables.
@@ -31,5 +36,5 @@
    - Capture release notes and migration guidance once the full LFQ pipeline has stabilized.
 
 ## Next Steps
-- Execute Step 2 by landing the protein grouping helper, then iterate through Steps 3–5 to deliver the complete protein LFQ pipeline.
-- Address lingering warnings in auxiliary crates when tackling subsequent milestones.
+- Prioritize delivering `ProteinQuantTrace::group_by_accession` to unblock the ignored acceptance tests before advancing to later milestones.
+- Once Step 2 is green, iterate through Steps 3–5 and address lingering warnings in auxiliary crates as part of the rollout.
