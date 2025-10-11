@@ -6,7 +6,7 @@ use crate::spectrum::MS1Spectra;
 use dashmap::DashMap;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Minimum normalized spectral angle required to integrate a peak
@@ -66,16 +66,28 @@ pub struct ProteinQuantTrace {
 }
 
 impl ProteinQuantTrace {
+    /// Aggregate peptide level quantification traces by their parent protein accession.
+    ///
+    /// The aggregation prefers iterator-based rollups so we do not rely on manual index
+    /// bookkeeping for intensity vectors that may be shorter than the expected run count.
+    /// During accumulation we also delay deduplication so we only sort and dedupe once per
+    /// protein at the end, which keeps cloning of shared [`Arc<str>`] accessions to a minimum
+    /// while still producing deterministic output.
     pub fn group_by_accession(
         db: &IndexedDatabase,
         traces: &[PeptideQuantTrace],
         run_count: usize,
         max_precursor_q: f32,
     ) -> HashMap<Arc<str>, ProteinQuantTrace> {
-        let mut proteins: HashMap<Arc<str>, ProteinQuantTrace> = HashMap::new();
+        // Track peptide indices in a `HashSet` while aggregating so we can guarantee
+        // deduplicated, sorted peptide membership lists once at the end of processing.
+        let mut proteins: HashMap<Arc<str>, (ProteinQuantTrace, HashSet<PeptideIx>)> =
+            HashMap::new();
 
         for trace in traces {
             let peptide = &db.peptides[trace.peptide.0 as usize];
+            // Clone and dedupe the accession list once per peptide to avoid repeatedly sorting
+            // the protein entry's vector inside the aggregation loop.
             let mut accessions = peptide.proteins.clone();
             accessions.sort_unstable_by(|a, b| a.as_ref().cmp(b.as_ref()));
             accessions.dedup_by(|a, b| a.as_ref() == b.as_ref());
@@ -83,88 +95,77 @@ impl ProteinQuantTrace {
             let peptide_decoy = peptide.decoy || trace.decoy;
 
             for accession in &accessions {
-                let entry =
-                    proteins
-                        .entry(Arc::clone(accession))
-                        .or_insert_with(|| ProteinQuantTrace {
-                            accessions: Vec::new(),
-                            decoy: false,
-                            intensities: Vec::new(),
-                            q_value: f32::INFINITY,
-                            total_peptide_count: 0,
-                            passing_peptide_count: 0,
-                            peptide_indices: Vec::new(),
-                            run_coverage: Vec::new(),
-                        });
+                let (entry, peptide_ix_set) =
+                    proteins.entry(Arc::clone(accession)).or_insert_with(|| {
+                        (
+                            ProteinQuantTrace {
+                                accessions: Vec::new(),
+                                decoy: false,
+                                intensities: vec![0.0; run_count],
+                                q_value: f32::INFINITY,
+                                total_peptide_count: 0,
+                                passing_peptide_count: 0,
+                                peptide_indices: Vec::new(),
+                                run_coverage: vec![0; run_count],
+                            },
+                            HashSet::new(),
+                        )
+                    });
 
                 entry.total_peptide_count += 1;
                 entry.q_value = entry.q_value.min(trace.peak.q_value);
                 entry.decoy |= peptide_decoy;
 
-                if entry.intensities.len() < run_count {
-                    entry.intensities.resize(run_count, 0.0);
-                }
-                if entry.run_coverage.len() < run_count {
-                    entry.run_coverage.resize(run_count, 0);
-                }
-
-                if entry.accessions.is_empty() {
-                    entry.accessions = accessions.clone();
-                } else {
-                    entry.accessions.extend(accessions.iter().cloned());
-                    entry
-                        .accessions
-                        .sort_unstable_by(|a, b| a.as_ref().cmp(b.as_ref()));
-                    entry.accessions.dedup_by(|a, b| a.as_ref() == b.as_ref());
-                }
+                // Collect accessions using cheap `Arc` clones; we intentionally defer sorting
+                // and deduplication until after aggregation to avoid repeated work.
+                entry.accessions.extend(accessions.iter().cloned());
 
                 if trace.peak.q_value <= max_precursor_q {
                     entry.passing_peptide_count += 1;
-                    if !entry.peptide_indices.contains(&trace.peptide) {
-                        entry.peptide_indices.push(trace.peptide);
-                    }
+                    peptide_ix_set.insert(trace.peptide);
 
-                    for (idx, &intensity) in trace.intensities.iter().enumerate() {
-                        if idx >= run_count {
-                            break;
-                        }
-
-                        entry.intensities[idx] += intensity;
+                    // Use iterator-based aggregation to safely handle traces shorter than the
+                    // expected run count without manual index bounds checks.
+                    for (run_idx, intensity) in trace
+                        .intensities
+                        .iter()
+                        .copied()
+                        .take(run_count)
+                        .enumerate()
+                    {
+                        entry.intensities[run_idx] += intensity;
                         if intensity > 0.0 {
-                            entry.run_coverage[idx] += 1;
+                            entry.run_coverage[run_idx] += 1;
                         }
                     }
                 }
             }
         }
 
-        for entry in proteins.values_mut() {
+        let mut finalized: HashMap<Arc<str>, ProteinQuantTrace> =
+            HashMap::with_capacity(proteins.len());
+
+        for (accession, (mut entry, peptide_ix_set)) in proteins {
             entry
                 .accessions
                 .sort_unstable_by(|a, b| a.as_ref().cmp(b.as_ref()));
             entry.accessions.dedup_by(|a, b| a.as_ref() == b.as_ref());
 
-            entry.peptide_indices.sort_unstable();
-            entry.peptide_indices.dedup();
-
-            if entry.intensities.len() < run_count {
-                entry.intensities.resize(run_count, 0.0);
-            } else if entry.intensities.len() > run_count {
-                entry.intensities.truncate(run_count);
-            }
-
-            if entry.run_coverage.len() < run_count {
-                entry.run_coverage.resize(run_count, 0);
-            } else if entry.run_coverage.len() > run_count {
-                entry.run_coverage.truncate(run_count);
-            }
+            entry.peptide_indices = peptide_ix_set.into_iter().collect();
+            entry.peptide_indices.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
             if entry.q_value.is_infinite() {
                 entry.q_value = 1.0;
             }
+
+            // Ensure the output vectors exactly match the requested run count.
+            entry.intensities.resize(run_count, 0.0);
+            entry.run_coverage.resize(run_count, 0);
+
+            finalized.insert(accession, entry);
         }
 
-        proteins
+        finalized
     }
 }
 
