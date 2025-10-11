@@ -176,6 +176,32 @@ fn q_value_filtering_excludes_high_q_peptides() {
     assert!((target.q_value - 0.004).abs() < f32::EPSILON);
 }
 
+#[test]
+fn run_coverage_counts_unique_peptides_per_run() {
+    let run_count = 2;
+    let db = fake_database(vec![fake_peptide("PEPU", &["P12345"], false)]);
+    let traces = vec![
+        fake_trace(0, false, 0.004, &[0.0, 10.0]),
+        fake_trace(0, false, 0.003, &[5.0, 0.0]),
+    ];
+
+    let proteins = ProteinQuantTrace::group_by_accession(&db, &traces, run_count, 0.01);
+
+    let mut accession = db.proteins(PeptideIx(0));
+    accession.sort_unstable();
+    accession.dedup();
+
+    let target = proteins
+        .get(&accession)
+        .expect("target protein missing");
+
+    assert_eq!(target.intensities, vec![5.0, 10.0]);
+    assert_eq!(target.run_coverage, vec![1, 1]);
+    assert_eq!(target.peptide_indices, vec![PeptideIx(0)]);
+    assert_eq!(target.total_peptide_count, 2);
+    assert_eq!(target.passing_peptide_count, 2);
+}
+
 fn digest_protein_map(
     proteins: &std::collections::BTreeMap<Vec<Arc<str>>, ProteinQuantTrace>,
 ) -> String {

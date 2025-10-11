@@ -90,8 +90,14 @@ impl ProteinQuantTrace {
     ) -> BTreeMap<Vec<Arc<str>>, ProteinQuantTrace> {
         // Track peptide indices in a `HashSet` while aggregating so we can guarantee
         // deduplicated, sorted peptide membership lists once at the end of processing.
-        let mut proteins: BTreeMap<Vec<Arc<str>>, (ProteinQuantTrace, HashSet<PeptideIx>)> =
-            BTreeMap::new();
+        let mut proteins: BTreeMap<
+            Vec<Arc<str>>,
+            (
+                ProteinQuantTrace,
+                HashSet<PeptideIx>,
+                Vec<HashSet<PeptideIx>>,
+            ),
+        > = BTreeMap::new();
 
         for trace in traces {
             let peptide = &db.peptides[trace.peptide.0 as usize];
@@ -104,7 +110,7 @@ impl ProteinQuantTrace {
 
             let peptide_decoy = peptide.decoy || trace.decoy;
 
-            let (entry, peptide_ix_set) = proteins
+            let (entry, peptide_ix_set, run_coverage_tracker) = proteins
                 .entry(accessions.clone())
                 .or_insert_with(|| {
                     (
@@ -119,6 +125,7 @@ impl ProteinQuantTrace {
                             run_coverage: vec![0; run_count],
                         },
                         HashSet::new(),
+                        (0..run_count).map(|_| HashSet::new()).collect(),
                     )
                 });
 
@@ -140,7 +147,9 @@ impl ProteinQuantTrace {
                     .enumerate()
                 {
                     entry.intensities[run_idx] += intensity;
-                    if intensity > 0.0 {
+                    if intensity > 0.0
+                        && run_coverage_tracker[run_idx].insert(trace.peptide)
+                    {
                         entry.run_coverage[run_idx] += 1;
                     }
                 }
@@ -149,7 +158,7 @@ impl ProteinQuantTrace {
 
         let mut finalized = BTreeMap::new();
 
-        for (accessions, (mut entry, peptide_ix_set)) in proteins {
+        for (accessions, (mut entry, peptide_ix_set, _run_coverage_tracker)) in proteins {
             entry
                 .accessions
                 .sort_unstable_by(|a, b| a.as_ref().cmp(b.as_ref()));
