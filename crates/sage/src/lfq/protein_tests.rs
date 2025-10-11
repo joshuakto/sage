@@ -74,7 +74,6 @@ fn fake_trace(peptide: usize, decoy: bool, q_value: f32, intensities: &[f64]) ->
 }
 
 #[test]
-#[ignore = "ProteinQuantTrace helper not implemented yet"]
 fn intensity_rollup_sums_targets() {
     let run_count = 3;
     let db = fake_database(vec![
@@ -103,7 +102,6 @@ fn intensity_rollup_sums_targets() {
 }
 
 #[test]
-#[ignore = "ProteinQuantTrace helper not implemented yet"]
 fn decoy_peptides_are_tracked_separately() {
     let run_count = 3;
     let db = fake_database(vec![
@@ -142,7 +140,6 @@ fn decoy_peptides_are_tracked_separately() {
 }
 
 #[test]
-#[ignore = "ProteinQuantTrace helper not implemented yet"]
 fn q_value_filtering_excludes_high_q_peptides() {
     let run_count = 3;
     let db = fake_database(vec![
