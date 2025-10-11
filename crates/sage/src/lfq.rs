@@ -127,8 +127,9 @@ impl ProteinQuantTrace {
             entry.decoy |= peptide_decoy;
 
             if trace.peak.q_value <= max_precursor_q {
-                entry.passing_peptide_count += 1;
-                peptide_ix_set.insert(trace.peptide);
+                if peptide_ix_set.insert(trace.peptide) {
+                    entry.passing_peptide_count += 1;
+                }
 
                 // Use iterator-based aggregation to safely handle traces shorter than the
                 // expected run count without manual index bounds checks.
