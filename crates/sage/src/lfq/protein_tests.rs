@@ -51,9 +51,15 @@ fn fake_peptide(seq: &str, proteins: &[&str], decoy: bool) -> Peptide {
     }
 }
 
-fn fake_trace(peptide: usize, decoy: bool, q_value: f32, intensities: &[f64]) -> PeptideQuantTrace {
+fn fake_trace_with_precursor(
+    precursor: PrecursorId,
+    peptide: usize,
+    decoy: bool,
+    q_value: f32,
+    intensities: &[f64],
+) -> PeptideQuantTrace {
     PeptideQuantTrace {
-        precursor: PrecursorId::Combined(PeptideIx(peptide as u32)),
+        precursor,
         peptide: PeptideIx(peptide as u32),
         decoy,
         peak: Peak {
@@ -71,6 +77,16 @@ fn fake_trace(peptide: usize, decoy: bool, q_value: f32, intensities: &[f64]) ->
         isotopic_distribution: [0.0f32; 3],
         time_warps: vec![0isize; intensities.len()],
     }
+}
+
+fn fake_trace(peptide: usize, decoy: bool, q_value: f32, intensities: &[f64]) -> PeptideQuantTrace {
+    fake_trace_with_precursor(
+        PrecursorId::Combined(PeptideIx(peptide as u32)),
+        peptide,
+        decoy,
+        q_value,
+        intensities,
+    )
 }
 
 #[test]
@@ -190,7 +206,6 @@ fn run_coverage_counts_unique_peptides_per_run() {
     let mut accession = db.proteins(PeptideIx(0));
     accession.sort_unstable();
     accession.dedup();
-
     let target = proteins
         .get(&accession)
         .expect("target protein missing");
@@ -200,6 +215,33 @@ fn run_coverage_counts_unique_peptides_per_run() {
     assert_eq!(target.peptide_indices, vec![PeptideIx(0)]);
     assert_eq!(target.total_peptide_count, 2);
     assert_eq!(target.passing_peptide_count, 2);
+  
+#[test]
+fn passing_peptide_count_matches_unique_peptides_without_charge_combining() {
+    let run_count = 1;
+    let db = fake_database(vec![fake_peptide("PEPA", &["P12345"], false)]);
+    let traces = vec![
+        fake_trace_with_precursor(
+            PrecursorId::Charged((PeptideIx(0), 2)),
+            0,
+            false,
+            0.001,
+            &[100.0],
+        ),
+        fake_trace_with_precursor(
+            PrecursorId::Charged((PeptideIx(0), 3)),
+            0,
+            false,
+            0.002,
+            &[150.0],
+        ),
+    let trace = proteins
+        .get(&accession)
+        .expect("expected protein entry to exist");
+
+    assert_eq!(trace.total_peptide_count, 2);
+    assert_eq!(trace.peptide_indices.len(), 1);
+    assert_eq!(trace.passing_peptide_count, trace.peptide_indices.len());
 }
 
 fn digest_protein_map(
