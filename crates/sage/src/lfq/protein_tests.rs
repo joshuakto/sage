@@ -215,7 +215,8 @@ fn run_coverage_counts_unique_peptides_per_run() {
     assert_eq!(target.peptide_indices, vec![PeptideIx(0)]);
     assert_eq!(target.total_peptide_count, 2);
     assert_eq!(target.passing_peptide_count, 2);
-  
+}
+
 #[test]
 fn passing_peptide_count_matches_unique_peptides_without_charge_combining() {
     let run_count = 1;
@@ -235,6 +236,13 @@ fn passing_peptide_count_matches_unique_peptides_without_charge_combining() {
             0.002,
             &[150.0],
         ),
+    ];
+
+    let proteins = ProteinQuantTrace::group_by_accession(&db, &traces, run_count, 0.01);
+
+    let mut accession = db.proteins(PeptideIx(0));
+    accession.sort_unstable();
+    accession.dedup();
     let trace = proteins
         .get(&accession)
         .expect("expected protein entry to exist");
