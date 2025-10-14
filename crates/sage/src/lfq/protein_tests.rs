@@ -236,6 +236,18 @@ fn passing_peptide_count_matches_unique_peptides_without_charge_combining() {
             0.002,
             &[150.0],
         ),
+        // The third trace represents a second quantified feature for the same
+        // peptide/charge combination (e.g. an additional chromatographic peak
+        // promoted during alignment). The protein rollup should still include
+        // its intensity while ensuring the unique peptide count is not
+        // inflated.
+        fake_trace_with_precursor(
+            PrecursorId::Charged((PeptideIx(0), 2)),
+            0,
+            false,
+            0.003,
+            &[200.0],
+        ),
     ];
 
     let proteins = ProteinQuantTrace::group_by_accession(&db, &traces, run_count, 0.01);
@@ -247,9 +259,11 @@ fn passing_peptide_count_matches_unique_peptides_without_charge_combining() {
         .get(&accession)
         .expect("expected protein entry to exist");
 
-    assert_eq!(trace.total_peptide_count, 2);
+    assert_eq!(trace.total_peptide_count, 3);
     assert_eq!(trace.peptide_indices.len(), 1);
-    assert_eq!(trace.passing_peptide_count, trace.peptide_indices.len());
+    assert_eq!(trace.passing_peptide_count, 1);
+    assert_eq!(trace.intensities, vec![450.0]);
+    assert_eq!(trace.run_coverage, vec![1]);
 }
 
 fn digest_protein_map(
