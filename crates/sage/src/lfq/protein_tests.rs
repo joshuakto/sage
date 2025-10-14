@@ -162,6 +162,39 @@ fn decoy_peptides_are_tracked_separately() {
 }
 
 #[test]
+fn reversed_decoy_peptides_get_unique_protein_groups() {
+    let run_count = 2;
+    let db = fake_database(vec![
+        fake_peptide("PEPTIDE", &["P12345"], false),
+        fake_peptide("EDITPEP", &["P12345"], true),
+    ]);
+    let traces = vec![
+        fake_trace(0, false, 0.004, &[25.0, 50.0]),
+        fake_trace(1, true, 0.006, &[10.0, 5.0]),
+    ];
+    let proteins = ProteinQuantTrace::group_by_accession(&db, &traces, run_count, 0.01);
+
+    let mut target_accession = db.proteins(PeptideIx(0));
+    target_accession.sort_unstable();
+    target_accession.dedup();
+    let target = proteins
+        .get(&target_accession)
+        .expect("target protein missing");
+    assert_eq!(proteins.len(), 2);
+    assert!(!target.decoy);
+    assert_eq!(target.accessions, target_accession);
+    assert_eq!(target.intensities, vec![25.0, 50.0]);
+
+    let decoy_accession = vec![Arc::<str>::from(format!("{}{}", db.decoy_tag, "P12345"))];
+    let decoy = proteins
+        .get(&decoy_accession)
+        .expect("decoy protein missing");
+    assert!(decoy.decoy);
+    assert_eq!(decoy.accessions, decoy_accession);
+    assert_eq!(decoy.intensities, vec![10.0, 5.0]);
+}
+
+#[test]
 fn q_value_filtering_excludes_high_q_peptides() {
     let run_count = 3;
     let db = fake_database(vec![
@@ -179,9 +212,7 @@ fn q_value_filtering_excludes_high_q_peptides() {
     let mut accession = db.proteins(PeptideIx(0));
     accession.sort_unstable();
     accession.dedup();
-    let target = proteins
-        .get(&accession)
-        .expect("target protein missing");
+    let target = proteins.get(&accession).expect("target protein missing");
 
     assert!(!target.decoy);
     assert_eq!(target.total_peptide_count, 3);
@@ -206,15 +237,15 @@ fn run_coverage_counts_unique_peptides_per_run() {
     let mut accession = db.proteins(PeptideIx(0));
     accession.sort_unstable();
     accession.dedup();
-    let target = proteins
-        .get(&accession)
-        .expect("target protein missing");
+    let target = proteins.get(&accession).expect("target protein missing");
 
     assert_eq!(target.intensities, vec![5.0, 10.0]);
     assert_eq!(target.run_coverage, vec![1, 1]);
     assert_eq!(target.peptide_indices, vec![PeptideIx(0)]);
     assert_eq!(target.total_peptide_count, 2);
-    assert_eq!(target.passing_peptide_count, 2);
+    // Even with multiple quantified features for the same peptide across runs, the
+    // passing peptide count reflects unique peptide membership.
+    assert_eq!(target.passing_peptide_count, 1);
 }
 
 #[test]
@@ -342,19 +373,13 @@ fn protein_grouping_is_deterministic_across_input_orders() {
     let mut reversed = traces.clone();
     reversed.reverse();
     let reversed_digest = digest_protein_map(&ProteinQuantTrace::group_by_accession(
-        &db,
-        &reversed,
-        run_count,
-        0.05,
+        &db, &reversed, run_count, 0.05,
     ));
 
     let mut rotated = traces.clone();
     rotated.rotate_left(2);
     let rotated_digest = digest_protein_map(&ProteinQuantTrace::group_by_accession(
-        &db,
-        &rotated,
-        run_count,
-        0.05,
+        &db, &rotated, run_count, 0.05,
     ));
 
     assert_eq!(canonical_digest, reversed_digest);

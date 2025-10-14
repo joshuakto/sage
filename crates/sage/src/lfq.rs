@@ -71,6 +71,11 @@ pub struct ProteinQuantTrace {
     pub run_coverage: Vec<usize>,
 }
 
+fn canonicalize_accessions(accessions: &mut Vec<Arc<str>>) {
+    accessions.sort_unstable_by(|a, b| a.as_ref().cmp(b.as_ref()));
+    accessions.dedup_by(|a, b| a.as_ref() == b.as_ref());
+}
+
 struct ProteinGroupAccumulator {
     trace: ProteinQuantTrace,
     peptides: HashSet<PeptideIx>,
@@ -78,7 +83,8 @@ struct ProteinGroupAccumulator {
 }
 
 impl ProteinGroupAccumulator {
-    fn new(accessions: Vec<Arc<str>>, run_count: usize) -> Self {
+    fn new(mut accessions: Vec<Arc<str>>, run_count: usize) -> Self {
+        canonicalize_accessions(&mut accessions);
         Self {
             trace: ProteinQuantTrace {
                 accessions,
@@ -127,13 +133,6 @@ impl ProteinGroupAccumulator {
     }
 
     fn finalize(mut self, run_count: usize) -> ProteinQuantTrace {
-        self.trace
-            .accessions
-            .sort_unstable_by(|a, b| a.as_ref().cmp(b.as_ref()));
-        self.trace
-            .accessions
-            .dedup_by(|a, b| a.as_ref() == b.as_ref());
-
         self.trace.peptide_indices = self.peptides.into_iter().collect();
         self.trace
             .peptide_indices
@@ -176,9 +175,23 @@ impl ProteinQuantTrace {
             // Clone and canonicalize the accession list once per peptide. The canonical ordering
             // serves both as the deterministic BTreeMap key and the final accession list stored in
             // the trace, so we only ever sort/deduplicate once per peptide.
-            let mut accessions = peptide.proteins.clone();
-            accessions.sort_unstable_by(|a, b| a.as_ref().cmp(b.as_ref()));
-            accessions.dedup_by(|a, b| a.as_ref() == b.as_ref());
+            let mut accessions: Vec<Arc<str>> = if peptide.decoy && db.generate_decoys {
+                let decoy_tag = db.decoy_tag.as_str();
+                peptide
+                    .proteins
+                    .iter()
+                    .map(|acc| {
+                        if acc.starts_with(decoy_tag) {
+                            acc.clone()
+                        } else {
+                            Arc::<str>::from(format!("{}{}", decoy_tag, acc))
+                        }
+                    })
+                    .collect()
+            } else {
+                peptide.proteins.clone()
+            };
+            canonicalize_accessions(&mut accessions);
 
             proteins
                 .entry(accessions.clone())
