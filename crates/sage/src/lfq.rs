@@ -107,9 +107,10 @@ impl ProteinGroupAccumulator {
         self.trace.decoy |= peptide_decoy;
 
         if trace.peak.q_value <= max_precursor_q {
-            self.trace.passing_peptide_count += 1;
-            self.peptides.insert(trace.peptide);
-
+            let is_new_peptide = self.peptides.insert(trace.peptide);
+            if is_new_peptide {
+                self.trace.passing_peptide_count += 1;
+            }
             for (run_idx, intensity) in trace
                 .intensities
                 .iter()
