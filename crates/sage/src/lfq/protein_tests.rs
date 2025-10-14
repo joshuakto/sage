@@ -243,9 +243,8 @@ fn run_coverage_counts_unique_peptides_per_run() {
     assert_eq!(target.run_coverage, vec![1, 1]);
     assert_eq!(target.peptide_indices, vec![PeptideIx(0)]);
     assert_eq!(target.total_peptide_count, 2);
-    // Even with multiple quantified features for the same peptide across runs, the
-    // passing peptide count reflects unique peptide membership.
-    assert_eq!(target.passing_peptide_count, 1);
+    // The passing peptide count mirrors the number of unique peptide indices.
+    assert_eq!(target.passing_peptide_count, target.peptide_indices.len());
 }
 
 #[test]
