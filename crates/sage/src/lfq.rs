@@ -182,20 +182,17 @@ impl ProteinQuantTrace {
                 // their target protein groups even when the database disables internal decoy
                 // generation.
                 let decoy_tag = db.decoy_tag.as_str();
-                peptide
-                    .proteins
-                    .iter()
+                accessions = accessions
+                    .into_iter()
                     .map(|acc| {
                         if acc.starts_with(decoy_tag) {
-                            acc.clone()
+                            acc
                         } else {
                             Arc::<str>::from(format!("{}{}", decoy_tag, acc))
                         }
                     })
-                    .collect()
-            } else {
-                peptide.proteins.clone()
-            };
+                    .collect();
+            }
             canonicalize_accessions(&mut accessions);
 
             proteins
