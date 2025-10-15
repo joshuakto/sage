@@ -162,6 +162,40 @@ fn decoy_peptides_are_tracked_separately() {
 }
 
 #[test]
+fn decoy_traces_for_target_peptides_form_separate_groups() {
+    let run_count = 2;
+    let db = fake_database(vec![fake_peptide("PEPA", &["P12345"], false)]);
+    let traces = vec![
+        fake_trace(0, false, 0.004, &[100.0, 25.0]),
+        fake_trace(0, true, 0.006, &[12.5, 7.5]),
+    ];
+
+    let proteins = ProteinQuantTrace::group_by_accession(&db, &traces, run_count, 0.01);
+
+    let mut target_accession = db.proteins(PeptideIx(0));
+    target_accession.sort_unstable();
+    target_accession.dedup();
+    let target = proteins
+        .get(&target_accession)
+        .expect("target protein missing");
+    assert_eq!(proteins.len(), 2);
+    assert!(!target.decoy);
+    assert_eq!(target.intensities, vec![100.0, 25.0]);
+    assert_eq!(target.total_peptide_count, 1);
+    assert_eq!(target.passing_peptide_count, 1);
+
+    let decoy_accession = vec![Arc::<str>::from(format!("{}{}", db.decoy_tag, "P12345"))];
+    let decoy = proteins
+        .get(&decoy_accession)
+        .expect("decoy protein missing");
+    assert!(decoy.decoy);
+    assert_eq!(decoy.accessions, decoy_accession);
+    assert_eq!(decoy.intensities, vec![12.5, 7.5]);
+    assert_eq!(decoy.total_peptide_count, 1);
+    assert_eq!(decoy.passing_peptide_count, 1);
+}
+
+#[test]
 fn reversed_decoy_peptides_get_unique_protein_groups() {
     let run_count = 2;
     let db = fake_database(vec![

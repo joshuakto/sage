@@ -175,22 +175,21 @@ impl ProteinQuantTrace {
             // Clone and canonicalize the accession list once per peptide. The canonical ordering
             // serves both as the deterministic BTreeMap key and the final accession list stored in
             // the trace, so we only ever sort/deduplicate once per peptide.
-            let mut accessions: Vec<Arc<str>> = if peptide.decoy && db.generate_decoys {
+            let mut accessions: Vec<Arc<str>> = peptide.proteins.clone();
+
+            if db.generate_decoys && (peptide.decoy || (trace.decoy && !peptide.decoy)) {
                 let decoy_tag = db.decoy_tag.as_str();
-                peptide
-                    .proteins
-                    .iter()
+                accessions = accessions
+                    .into_iter()
                     .map(|acc| {
                         if acc.starts_with(decoy_tag) {
-                            acc.clone()
+                            acc
                         } else {
                             Arc::<str>::from(format!("{}{}", decoy_tag, acc))
                         }
                     })
-                    .collect()
-            } else {
-                peptide.proteins.clone()
-            };
+                    .collect();
+            }
             canonicalize_accessions(&mut accessions);
 
             proteins
