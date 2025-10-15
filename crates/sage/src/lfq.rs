@@ -175,7 +175,9 @@ impl ProteinQuantTrace {
             // Clone and canonicalize the accession list once per peptide. The canonical ordering
             // serves both as the deterministic BTreeMap key and the final accession list stored in
             // the trace, so we only ever sort/deduplicate once per peptide.
-            let mut accessions: Vec<Arc<str>> = if peptide.decoy || trace.decoy {
+            let mut accessions: Vec<Arc<str>> = peptide.proteins.iter().cloned().collect();
+
+            if peptide.decoy || trace.decoy {
                 // Prefix all accessions with the decoy tag whenever either the peptide itself is
                 // a FASTA-supplied decoy or the quantification trace represents a synthetic decoy
                 // emitted alongside a target peptide. This keeps trace-level decoys separated from
