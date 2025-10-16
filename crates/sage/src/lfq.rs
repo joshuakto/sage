@@ -1,3 +1,9 @@
+//! Label-free quantification routines.
+//!
+//! Protein-level aggregation relies on deterministic data structures so repeated analyses
+//! produce bytewise-identical outputs that downstream reporting and regulatory pipelines can
+//! reproduce.
+
 use crate::database::{binary_search_slice, IndexedDatabase, PeptideIx};
 use crate::mass::{composition, Composition, Tolerance, NEUTRON};
 use crate::ml::{matrix::Matrix, retention_alignment::Alignment};
@@ -6,7 +12,8 @@ use crate::spectrum::MS1Spectra;
 use dashmap::DashMap;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
 /// Minimum normalized spectral angle required to integrate a peak
 // const MIN_SPECTRAL_ANGLE: f64 = 0.70;
@@ -50,6 +57,197 @@ pub struct PeptideQuantTrace {
     pub raw_isotope_traces: Matrix,
     pub isotopic_distribution: [f32; N_ISOTOPES],
     pub time_warps: Vec<isize>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProteinQuantTrace {
+    pub accessions: Vec<Arc<str>>,
+    pub decoy: bool,
+    pub intensities: Vec<f64>,
+    pub q_value: f32,
+    pub total_peptide_count: usize,
+    pub passing_peptide_count: usize,
+    pub peptide_indices: Vec<PeptideIx>,
+    pub run_coverage: Vec<usize>,
+}
+
+fn canonicalize_accessions(accessions: &mut Vec<Arc<str>>) {
+    accessions.sort_unstable_by(|a, b| a.as_ref().cmp(b.as_ref()));
+    accessions.dedup_by(|a, b| a.as_ref() == b.as_ref());
+}
+
+struct ProteinGroupAccumulator {
+    trace: ProteinQuantTrace,
+    peptides: HashSet<PeptideIx>,
+    run_contributors: Vec<HashSet<PeptideIx>>,
+}
+
+impl ProteinGroupAccumulator {
+    fn new(mut accessions: Vec<Arc<str>>, run_count: usize) -> Self {
+        canonicalize_accessions(&mut accessions);
+        Self {
+            trace: ProteinQuantTrace {
+                accessions,
+                decoy: false,
+                intensities: vec![0.0; run_count],
+                q_value: f32::INFINITY,
+                total_peptide_count: 0,
+                passing_peptide_count: 0,
+                peptide_indices: Vec::new(),
+                run_coverage: vec![0; run_count],
+            },
+            peptides: HashSet::new(),
+            run_contributors: (0..run_count).map(|_| HashSet::new()).collect(),
+        }
+    }
+
+    fn ingest_trace(
+        &mut self,
+        trace: &PeptideQuantTrace,
+        peptide_decoy: bool,
+        max_precursor_q: f32,
+        run_count: usize,
+    ) {
+        self.trace.total_peptide_count += 1;
+        self.trace.q_value = self.trace.q_value.min(trace.peak.q_value);
+        self.trace.decoy |= peptide_decoy;
+
+        if trace.peak.q_value <= max_precursor_q {
+            let is_new_peptide = self.peptides.insert(trace.peptide);
+            if is_new_peptide {
+                self.trace.passing_peptide_count += 1;
+            }
+            for (run_idx, intensity) in trace
+                .intensities
+                .iter()
+                .copied()
+                .take(run_count)
+                .enumerate()
+            {
+                self.trace.intensities[run_idx] += intensity;
+                if intensity > 0.0 && self.run_contributors[run_idx].insert(trace.peptide) {
+                    self.trace.run_coverage[run_idx] += 1;
+                }
+            }
+        }
+    }
+
+    fn finalize(mut self, run_count: usize) -> ProteinQuantTrace {
+        self.trace.peptide_indices = self.peptides.into_iter().collect();
+        self.trace
+            .peptide_indices
+            .sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+        if self.trace.q_value.is_infinite() {
+            self.trace.q_value = 1.0;
+        }
+
+        self.trace.intensities.resize(run_count, 0.0);
+        self.trace.run_coverage.resize(run_count, 0);
+
+        self.trace
+    }
+}
+
+impl ProteinQuantTrace {
+    /// Aggregate peptide level quantification traces by their parent protein accession set.
+    ///
+    /// Accessions are canonicalized (sorted and deduplicated) before they become keys inside the
+    /// aggregation [`BTreeMap`]. This guarantees deterministic ordering for every consumer of the
+    /// resulting protein groups, irrespective of the order in which peptides were processed. The
+    /// aggregation prefers iterator-based rollups so we do not rely on manual index bookkeeping
+    /// for intensity vectors that may be shorter than the expected run count. During accumulation
+    /// we delay deduplication of peptide membership until the end so we only sort once per protein
+    /// group, which keeps cloning of shared [`Arc<str>`] accessions to a minimum while still
+    /// producing reproducible output.
+    pub fn group_by_accession(
+        db: &IndexedDatabase,
+        traces: &[PeptideQuantTrace],
+        run_count: usize,
+        max_precursor_q: f32,
+    ) -> BTreeMap<Vec<Arc<str>>, ProteinQuantTrace> {
+        // Track peptide indices in a `HashSet` while aggregating so we can guarantee
+        // deduplicated, sorted peptide membership lists once at the end of processing.
+        let mut proteins: BTreeMap<Vec<Arc<str>>, ProteinGroupAccumulator> = BTreeMap::new();
+
+        for trace in traces {
+            let peptide = &db.peptides[trace.peptide.0 as usize];
+            // Clone and canonicalize the accession list once per peptide. The canonical ordering
+            // serves both as the deterministic BTreeMap key and the final accession list stored in
+            // the trace, so we only ever sort/deduplicate once per peptide.
+            let mut accessions: Vec<Arc<str>> = match (peptide.decoy, trace.decoy) {
+                (true, _) => {
+                    // FASTA-supplied decoys retain their recorded accession strings. When the
+                    // FASTA already includes the decoy prefix we keep it as-is; otherwise we add
+                    // the tag so picked-decoy databases and user-provided decoys share the same
+                    // namespace.
+                    let decoy_tag = db.decoy_tag.as_str();
+                    peptide
+                        .proteins
+                        .iter()
+                        .map(|acc| {
+                            if acc.starts_with(decoy_tag) {
+                                acc.clone()
+                            } else {
+                                Arc::<str>::from(format!("{}{}", decoy_tag, acc.as_ref()))
+                            }
+                        })
+                        .collect()
+                }
+                (false, true) => {
+                    // Synthetic trace-level decoys derived from target peptides reuse the
+                    // accession list but occupy a dedicated namespace so they do not merge with
+                    // FASTA-provided decoys that may already carry the same decoy-tagged
+                    // identifier.
+                    let decoy_tag = db.decoy_tag.as_str();
+                    peptide
+                        .proteins
+                        .iter()
+                        .map(|acc| {
+                            Arc::<str>::from(format!("{}{}#TRACE", decoy_tag, acc.as_ref()))
+                        })
+                        .collect()
+                }
+                (false, false) => peptide.proteins.clone(),
+            };
+            canonicalize_accessions(&mut accessions);
+
+            proteins
+                .entry(accessions.clone())
+                .or_insert_with(|| ProteinGroupAccumulator::new(accessions.clone(), run_count))
+                .ingest_trace(
+                    trace,
+                    peptide.decoy || trace.decoy,
+                    max_precursor_q,
+                    run_count,
+                );
+        }
+
+        let mut finalized = BTreeMap::new();
+
+        for (accessions, accumulator) in proteins {
+            finalized.insert(accessions, accumulator.finalize(run_count));
+        }
+
+        finalized
+    }
+
+    /// Deterministically iterate over aggregated protein groups in ascending accession order.
+    pub fn ordered_groups<'a>(
+        proteins: &'a BTreeMap<Vec<Arc<str>>, ProteinQuantTrace>,
+    ) -> impl Iterator<Item = (&'a [Arc<str>], &'a ProteinQuantTrace)> + 'a {
+        proteins
+            .iter()
+            .map(|(accessions, trace)| (accessions.as_slice(), trace))
+    }
+
+    /// Deterministically iterate over the protein quantification traces only, preserving the
+    /// ascending order imposed by [`ordered_groups`].
+    pub fn ordered_values<'a>(
+        proteins: &'a BTreeMap<Vec<Arc<str>>, ProteinQuantTrace>,
+    ) -> impl Iterator<Item = &'a ProteinQuantTrace> + 'a {
+        proteins.values()
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -892,4 +1090,3 @@ impl Query<'_> {
 
 #[cfg(all(test, feature = "protein-quant-prototype"))]
 mod protein_tests;
-
