@@ -198,7 +198,8 @@ fn fasta_provided_decoys_keep_traces_and_peptides_separate() {
     assert_eq!(target.peptide_indices, vec![PeptideIx(0)]);
     assert_eq!(target.run_coverage, vec![1, 1]);
 
-    let trace_decoy_accession = vec![Arc::<str>::from(format!("{}{}", db.decoy_tag, "P12345"))];
+    let trace_decoy_accession =
+        vec![Arc::<str>::from(format!("{}{}#TRACE", db.decoy_tag, "P12345"))];
     let trace_decoy = proteins
         .get(&trace_decoy_accession)
         .expect("synthetic decoy protein missing");
@@ -226,6 +227,47 @@ fn fasta_provided_decoys_keep_traces_and_peptides_separate() {
 }
 
 #[test]
+fn synthetic_trace_decoys_do_not_merge_with_fasta_decoys() {
+    let run_count = 2;
+    let db = fake_database_with_fasta_decoys(vec![
+        fake_peptide("TARGET", &["P12345"], false),
+        fake_peptide("FASTA", &["P12345"], true),
+    ]);
+    let traces = vec![
+        fake_trace(0, false, 0.004, &[80.0, 20.0]),
+        fake_trace(0, true, 0.005, &[10.0, 0.0]),
+        fake_trace(1, true, 0.006, &[5.0, 5.0]),
+    ];
+
+    let proteins = ProteinQuantTrace::group_by_accession(&db, &traces, run_count, 0.01);
+
+    let mut target_accession = db.proteins(PeptideIx(0));
+    target_accession.sort_unstable();
+    target_accession.dedup();
+    let target = proteins
+        .get(&target_accession)
+        .expect("target protein missing");
+    assert_eq!(target.intensities, vec![80.0, 20.0]);
+
+    let trace_decoy_accession =
+        vec![Arc::<str>::from(format!("{}{}#TRACE", db.decoy_tag, "P12345"))];
+    let trace_decoy = proteins
+        .get(&trace_decoy_accession)
+        .expect("synthetic trace decoy missing");
+    assert!(trace_decoy.decoy);
+    assert_eq!(trace_decoy.intensities, vec![10.0, 0.0]);
+
+    let fasta_decoy_accession = vec![Arc::<str>::from(format!("{}{}", db.decoy_tag, "P12345"))];
+    let fasta_decoy = proteins
+        .get(&fasta_decoy_accession)
+        .expect("FASTA decoy missing");
+    assert!(fasta_decoy.decoy);
+    assert_eq!(fasta_decoy.intensities, vec![5.0, 5.0]);
+
+    assert_eq!(proteins.len(), 3);
+}
+
+#[test]
 fn decoy_traces_for_target_peptides_form_separate_groups() {
     let run_count = 2;
     let db = fake_database(vec![fake_peptide("PEPA", &["P12345"], false)]);
@@ -248,7 +290,8 @@ fn decoy_traces_for_target_peptides_form_separate_groups() {
     assert_eq!(target.total_peptide_count, 1);
     assert_eq!(target.passing_peptide_count, 1);
 
-    let decoy_accession = vec![Arc::<str>::from(format!("{}{}", db.decoy_tag, "P12345"))];
+    let decoy_accession =
+        vec![Arc::<str>::from(format!("{}{}#TRACE", db.decoy_tag, "P12345"))];
     let decoy = proteins
         .get(&decoy_accession)
         .expect("decoy protein missing");
