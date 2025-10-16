@@ -175,26 +175,40 @@ impl ProteinQuantTrace {
             // Clone and canonicalize the accession list once per peptide. The canonical ordering
             // serves both as the deterministic BTreeMap key and the final accession list stored in
             // the trace, so we only ever sort/deduplicate once per peptide.
-            let mut accessions: Vec<Arc<str>> = if peptide.decoy || trace.decoy {
-                // Prefix all accessions with the decoy tag whenever either the peptide itself is
-                // a FASTA-supplied decoy or the quantification trace represents a synthetic decoy
-                // emitted alongside a target peptide. This keeps trace-level decoys separated from
-                // their target protein groups even when the database disables internal decoy
-                // generation.
-                let decoy_tag = db.decoy_tag.as_str();
-                peptide
-                    .proteins
-                    .iter()
-                    .map(|acc| {
-                        if acc.starts_with(decoy_tag) {
-                            acc.clone()
-                        } else {
-                            Arc::<str>::from(format!("{}{}", decoy_tag, acc.as_ref()))
-                        }
-                    })
-                    .collect()
-            } else {
-                peptide.proteins.clone()
+            let mut accessions: Vec<Arc<str>> = match (peptide.decoy, trace.decoy) {
+                (true, _) => {
+                    // FASTA-supplied decoys retain their recorded accession strings. When the
+                    // FASTA already includes the decoy prefix we keep it as-is; otherwise we add
+                    // the tag so picked-decoy databases and user-provided decoys share the same
+                    // namespace.
+                    let decoy_tag = db.decoy_tag.as_str();
+                    peptide
+                        .proteins
+                        .iter()
+                        .map(|acc| {
+                            if acc.starts_with(decoy_tag) {
+                                acc.clone()
+                            } else {
+                                Arc::<str>::from(format!("{}{}", decoy_tag, acc.as_ref()))
+                            }
+                        })
+                        .collect()
+                }
+                (false, true) => {
+                    // Synthetic trace-level decoys derived from target peptides reuse the
+                    // accession list but occupy a dedicated namespace so they do not merge with
+                    // FASTA-provided decoys that may already carry the same decoy-tagged
+                    // identifier.
+                    let decoy_tag = db.decoy_tag.as_str();
+                    peptide
+                        .proteins
+                        .iter()
+                        .map(|acc| {
+                            Arc::<str>::from(format!("{}{}#TRACE", decoy_tag, acc.as_ref()))
+                        })
+                        .collect()
+                }
+                (false, false) => peptide.proteins.clone(),
             };
             canonicalize_accessions(&mut accessions);
 
