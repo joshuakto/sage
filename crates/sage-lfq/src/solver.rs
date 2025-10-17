@@ -202,14 +202,46 @@ fn solve_least_squares(ratios: &RatioMatrix) -> Option<Vec<f64>> {
         }
     }
 
-    if values.iter().any(|value| value.is_none()) {
+    if ratios
+        .active_samples
+        .iter()
+        .enumerate()
+        .any(|(idx, active)| *active && values[idx].is_none())
+    {
         return None;
     }
 
-    let mut result: Vec<f64> = values.into_iter().map(|value| value.unwrap()).collect();
-    let mean = result.iter().copied().sum::<f64>() / result.len() as f64;
-    for value in &mut result {
-        *value -= mean;
+    let mean = {
+        let mut sum = 0.0f64;
+        let mut count = 0usize;
+        for (idx, value) in values.iter().enumerate() {
+            if ratios.active_samples[idx] {
+                if let Some(v) = value {
+                    sum += *v;
+                    count += 1;
+                }
+            }
+        }
+
+        if count == 0 {
+            0.0
+        } else {
+            sum / count as f64
+        }
+    };
+
+    let mut result = Vec::with_capacity(values.len());
+    for (idx, value) in values.into_iter().enumerate() {
+        match value {
+            Some(mut v) => {
+                v -= mean;
+                result.push(v);
+            }
+            None => {
+                debug_assert!(!ratios.active_samples[idx]);
+                result.push(f64::NAN);
+            }
+        }
     }
 
     Some(result)
@@ -224,7 +256,11 @@ fn rescale_to_absolute(log_intensities: &[f64], original_matrix: &CsMat<f32>) ->
         .iter()
         .map(|value| 2f64.powf(*value))
         .collect();
-    let weight_sum: f64 = weights.iter().copied().sum();
+    let weight_sum: f64 = weights
+        .iter()
+        .copied()
+        .filter(|weight| weight.is_finite())
+        .sum();
 
     let mut total_linear = 0.0f64;
     for row in original_matrix.outer_iterator() {
@@ -234,12 +270,18 @@ fn rescale_to_absolute(log_intensities: &[f64], original_matrix: &CsMat<f32>) ->
     }
 
     if weight_sum == 0.0 {
-        return vec![0.0; log_intensities.len()];
+        return vec![f32::NAN; log_intensities.len()];
     }
 
     weights
         .iter()
-        .map(|weight| (weight / weight_sum * total_linear) as f32)
+        .map(|weight| {
+            if weight.is_finite() {
+                (weight / weight_sum * total_linear) as f32
+            } else {
+                f32::NAN
+            }
+        })
         .collect()
 }
 
