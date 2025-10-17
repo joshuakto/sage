@@ -47,7 +47,10 @@ impl ProteinSolver {
             lfq_intensities,
             raw_intensities,
             n_peptides: peptide_submatrix.rows(),
-            n_quantified_samples: log_intensities.len(),
+            n_quantified_samples: log_intensities
+                .iter()
+                .filter(|value| value.is_finite())
+                .count(),
         })
     }
 }
