@@ -1,0 +1,17 @@
+[package]
+name = "sage-lfq"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sage-core = { path = "../sage" }
+rayon = "1.7"
+petgraph = "0.6"
+sprs = "0.11"
+nalgebra = "0.32"
+statrs = "0.16"
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "1.0"
+
+[dev-dependencies]
+approx = "0.5"
