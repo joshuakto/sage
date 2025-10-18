@@ -113,7 +113,17 @@ fn build_ratio_matrix(submatrix: &CsMat<f32>, norm_factors: &[f64]) -> Option<Ra
         }
     }
 
+    let active_count = active.iter().filter(|&&is_active| is_active).count();
+
     if !has_ratio {
+        if active_count == 1 {
+            return Some(RatioMatrix {
+                ratios,
+                counts,
+                active_samples: active,
+            });
+        }
+
         return None;
     }
 
