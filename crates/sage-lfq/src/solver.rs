@@ -1,7 +1,7 @@
 use crate::MaxLfqConfig;
 use nalgebra::DMatrix;
 use sprs::CsMat;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 pub struct ProteinProfile {
     pub lfq_intensities: Vec<f32>,
@@ -21,10 +21,9 @@ struct RatioMatrix {
 impl ProteinSolver {
     pub fn quantify(
         peptide_submatrix: &CsMat<f32>,
-        norm_factors: &[f64],
         config: &MaxLfqConfig,
     ) -> Option<ProteinProfile> {
-        let ratio_matrix = build_ratio_matrix(peptide_submatrix, norm_factors)?;
+        let ratio_matrix = build_ratio_matrix(peptide_submatrix)?;
 
         if !is_connected(&ratio_matrix) {
             return None;
@@ -55,7 +54,12 @@ impl ProteinSolver {
     }
 }
 
-fn build_ratio_matrix(submatrix: &CsMat<f32>, _norm_factors: &[f64]) -> Option<RatioMatrix> {
+/// Build pairwise ratio matrix using median aggregation (MaxLFQ standard).
+/// 
+/// For each sample pair (i,j), computes the median of log-ratios across all
+/// peptides observed in both samples. Median provides robustness against
+/// outlier peptides compared to mean aggregation.
+fn build_ratio_matrix(submatrix: &CsMat<f32>) -> Option<RatioMatrix> {
     let n_samples = submatrix.cols();
     if n_samples == 0 {
         return Some(RatioMatrix {
@@ -65,8 +69,8 @@ fn build_ratio_matrix(submatrix: &CsMat<f32>, _norm_factors: &[f64]) -> Option<R
         });
     }
 
-    let mut ratios = DMatrix::from_element(n_samples, n_samples, 0.0f32);
-    let mut counts = DMatrix::from_element(n_samples, n_samples, 0usize);
+    // Collect all pairwise ratios for median calculation
+    let mut pairwise_ratios: HashMap<(usize, usize), Vec<f32>> = HashMap::new();
     let mut active = vec![false; n_samples];
 
     for row in submatrix.outer_iterator() {
@@ -83,28 +87,38 @@ fn build_ratio_matrix(submatrix: &CsMat<f32>, _norm_factors: &[f64]) -> Option<R
             continue;
         }
 
+        // Collect log-ratios for each sample pair
         for i in 0..entries.len() {
             for j in (i + 1)..entries.len() {
                 let (col_i, value_i) = entries[i];
                 let (col_j, value_j) = entries[j];
                 let diff = (value_j - value_i) as f32;
 
-                ratios[(col_i, col_j)] += diff;
-                ratios[(col_j, col_i)] -= diff;
-                counts[(col_i, col_j)] += 1;
-                counts[(col_j, col_i)] += 1;
+                pairwise_ratios
+                    .entry((col_i, col_j))
+                    .or_insert_with(Vec::new)
+                    .push(diff);
+                pairwise_ratios
+                    .entry((col_j, col_i))
+                    .or_insert_with(Vec::new)
+                    .push(-diff);
             }
         }
     }
 
+    // Compute median for each pair (more robust than mean)
+    let mut ratios = DMatrix::from_element(n_samples, n_samples, 0.0f32);
+    let mut counts = DMatrix::from_element(n_samples, n_samples, 0usize);
     let mut has_ratio = false;
-    for i in 0..n_samples {
-        for j in 0..n_samples {
-            let count = counts[(i, j)];
-            if count > 0 {
-                ratios[(i, j)] /= count as f32;
-                has_ratio = true;
-            }
+
+    for ((i, j), mut values) in pairwise_ratios {
+        if !values.is_empty() {
+            values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let median = compute_median(&values);
+            
+            ratios[(i, j)] = median;
+            counts[(i, j)] = values.len();
+            has_ratio = true;
         }
     }
 
@@ -127,6 +141,19 @@ fn build_ratio_matrix(submatrix: &CsMat<f32>, _norm_factors: &[f64]) -> Option<R
         counts,
         active_samples: active,
     })
+}
+
+/// Compute median of sorted values.
+fn compute_median(sorted_values: &[f32]) -> f32 {
+    let n = sorted_values.len();
+    if n == 0 {
+        return 0.0;
+    }
+    if n % 2 == 0 {
+        (sorted_values[n / 2 - 1] + sorted_values[n / 2]) / 2.0
+    } else {
+        sorted_values[n / 2]
+    }
 }
 
 fn is_connected(ratios: &RatioMatrix) -> bool {
@@ -331,12 +358,95 @@ mod tests {
         triplets.add_triplet(1, 1, 13.0);
 
         let matrix = triplets.to_csr();
-        let normalization = vec![11.0, 12.0];
 
-        let ratio_matrix = build_ratio_matrix(&matrix, &normalization).expect("ratio matrix");
+        let ratio_matrix = build_ratio_matrix(&matrix).expect("ratio matrix");
         let log_intensities = solve_least_squares(&ratio_matrix).expect("lfq solution");
 
         let diff = log_intensities[1] - log_intensities[0];
         assert!((diff - 1.0).abs() < 1e-6, "expected fold-change of 1, got {diff}");
+    }
+    
+    #[test]
+    fn median_robust_to_outliers() {
+        // Test that median aggregation is robust to outlier peptides
+        let mut triplets = TriMat::new((5, 2)); // 5 peptides, 2 samples
+        
+        // 4 peptides show 1.0 log2 fold-change
+        triplets.add_triplet(0, 0, 10.0);
+        triplets.add_triplet(0, 1, 11.0);
+        triplets.add_triplet(1, 0, 10.0);
+        triplets.add_triplet(1, 1, 11.0);
+        triplets.add_triplet(2, 0, 10.0);
+        triplets.add_triplet(2, 1, 11.0);
+        triplets.add_triplet(3, 0, 10.0);
+        triplets.add_triplet(3, 1, 11.0);
+        
+        // 1 outlier peptide shows 5.0 log2 fold-change (contamination/mismatch)
+        triplets.add_triplet(4, 0, 10.0);
+        triplets.add_triplet(4, 1, 15.0);
+        
+        let matrix = triplets.to_csr();
+        let ratio_matrix = build_ratio_matrix(&matrix).expect("ratio matrix");
+        
+        // Median should be ~1.0, not affected by outlier
+        let median_ratio = ratio_matrix.ratios[(0, 1)];
+        assert!((median_ratio - 1.0).abs() < 0.1, 
+                "median should be ~1.0, got {median_ratio}");
+    }
+    
+    #[test]
+    fn single_sample_protein_quantification() {
+        // Test that proteins quantified in only one sample are handled
+        let config = MaxLfqConfig {
+            min_peptides_per_ratio: 2,
+            min_samples_for_protein: 1,
+        };
+        
+        let mut triplets = TriMat::new((2, 4)); // 2 peptides, 4 samples
+        triplets.add_triplet(0, 2, 10.0); // Only in sample 2
+        triplets.add_triplet(1, 2, 12.0);
+        
+        let matrix = triplets.to_csr();
+        let result = ProteinSolver::quantify(&matrix, &config);
+        
+        assert!(result.is_some(), "single-sample protein should be quantified");
+        let profile = result.unwrap();
+        assert_eq!(profile.n_quantified_samples, 1);
+    }
+    
+    #[test]
+    fn disconnected_samples_rejected() {
+        // Test that proteins with no shared peptides between samples are rejected
+        let config = MaxLfqConfig {
+            min_peptides_per_ratio: 2,
+            min_samples_for_protein: 1,
+        };
+        
+        let mut triplets = TriMat::new((4, 4)); // 4 peptides, 4 samples
+        // Peptides 0,1 only in samples 0,1
+        triplets.add_triplet(0, 0, 10.0);
+        triplets.add_triplet(0, 1, 11.0);
+        triplets.add_triplet(1, 0, 10.0);
+        triplets.add_triplet(1, 1, 11.0);
+        
+        // Peptides 2,3 only in samples 2,3 (disconnected!)
+        triplets.add_triplet(2, 2, 10.0);
+        triplets.add_triplet(2, 3, 11.0);
+        triplets.add_triplet(3, 2, 10.0);
+        triplets.add_triplet(3, 3, 11.0);
+        
+        let matrix = triplets.to_csr();
+        let result = ProteinSolver::quantify(&matrix, &config);
+        
+        assert!(result.is_none(), "disconnected samples should be rejected");
+    }
+    
+    #[test]
+    fn median_calculation_correctness() {
+        // Test median calculation for different scenarios
+        assert_eq!(compute_median(&[1.0]), 1.0);
+        assert_eq!(compute_median(&[1.0, 2.0, 3.0]), 2.0);
+        assert_eq!(compute_median(&[1.0, 2.0, 3.0, 4.0]), 2.5);
+        assert_eq!(compute_median(&[]), 0.0);
     }
 }

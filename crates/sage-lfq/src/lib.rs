@@ -23,10 +23,9 @@ pub fn quantify_proteins(
         .unwrap_or(0);
 
     let intensity_matrix = matrix::IntensityMatrix::from_peptide_traces(peptide_traces, n_samples);
-    let normalization = normalization::NormalizationFactors::compute(
-        &intensity_matrix,
-        config.min_peptides_per_ratio,
-    )?;
+    
+    // Note: Normalization is handled implicitly by MaxLFQ's least-squares optimization
+    // Pre-normalization was removed as it inappropriately removed biological signal
 
     let mut results = Vec::with_capacity(protein_groups.len());
 
@@ -48,7 +47,7 @@ pub fn quantify_proteins(
             return Err(MaxLfqError::InsufficientPeptides(protein_ids.join(",")));
         }
 
-        match ProteinSolver::quantify(&peptide_submatrix, &normalization.factors, &config) {
+        match ProteinSolver::quantify(&peptide_submatrix, &config) {
             Some(profile) => {
                 let mut sample_coverage = vec![false; intensity_matrix.n_samples];
                 for row in peptide_submatrix.outer_iterator() {
