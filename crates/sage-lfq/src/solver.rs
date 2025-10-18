@@ -55,7 +55,7 @@ impl ProteinSolver {
     }
 }
 
-fn build_ratio_matrix(submatrix: &CsMat<f32>, norm_factors: &[f64]) -> Option<RatioMatrix> {
+fn build_ratio_matrix(submatrix: &CsMat<f32>, _norm_factors: &[f64]) -> Option<RatioMatrix> {
     let n_samples = submatrix.cols();
     if n_samples == 0 {
         return Some(RatioMatrix {
@@ -72,12 +72,7 @@ fn build_ratio_matrix(submatrix: &CsMat<f32>, norm_factors: &[f64]) -> Option<Ra
     for row in submatrix.outer_iterator() {
         let entries: Vec<(usize, f64)> = row
             .iter()
-            .map(|(col, &value)| {
-                (
-                    col,
-                    value as f64 - norm_factors.get(col).copied().unwrap_or(0.0),
-                )
-            })
+            .map(|(col, &value)| (col, value as f64))
             .collect();
 
         for (col, _) in &entries {
@@ -320,4 +315,28 @@ fn extract_raw_intensities(submatrix: &CsMat<f32>) -> Vec<f32> {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sprs::TriMat;
+
+    #[test]
+    fn preserves_consistent_fold_change_in_ratios() {
+        let mut triplets = TriMat::new((2, 2));
+        triplets.add_triplet(0, 0, 10.0);
+        triplets.add_triplet(0, 1, 11.0);
+        triplets.add_triplet(1, 0, 12.0);
+        triplets.add_triplet(1, 1, 13.0);
+
+        let matrix = triplets.to_csr();
+        let normalization = vec![11.0, 12.0];
+
+        let ratio_matrix = build_ratio_matrix(&matrix, &normalization).expect("ratio matrix");
+        let log_intensities = solve_least_squares(&ratio_matrix).expect("lfq solution");
+
+        let diff = log_intensities[1] - log_intensities[0];
+        assert!((diff - 1.0).abs() < 1e-6, "expected fold-change of 1, got {diff}");
+    }
 }
