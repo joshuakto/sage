@@ -44,10 +44,10 @@ fn quantify_protein_groups_converts_peptides() {
 
     assert_eq!(results.len(), 1);
     let protein = &results[0];
-    assert_eq!(protein.protein_ids, vec!["P12345".to_string()]);
-    assert_eq!(protein.peptide_count, 2);
-    assert_eq!(protein.sample_coverage.len(), run_count);
-    assert!(protein.sample_coverage[0]);
+    assert_eq!(protein.quant.protein_ids, vec!["P12345".to_string()]);
+    assert_eq!(protein.quant.peptide_count, 2);
+    assert_eq!(protein.quant.sample_coverage.len(), run_count);
+    assert!(protein.quant.sample_coverage[0]);
 }
 
 #[test]
@@ -84,8 +84,8 @@ fn single_peptide_proteins_are_filtered_not_fatal() {
     // Only the multi-peptide protein should be quantified
     assert_eq!(results.len(), 1);
     let protein = &results[0];
-    assert_eq!(protein.protein_ids, vec!["P22222".to_string()]);
-    assert_eq!(protein.peptide_count, 2);
+    assert_eq!(protein.quant.protein_ids, vec!["P22222".to_string()]);
+    assert_eq!(protein.quant.peptide_count, 2);
 }
 
 impl IndexedDatabaseProteinsExt for IndexedDatabase {

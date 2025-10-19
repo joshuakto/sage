@@ -84,6 +84,27 @@ pub struct ProteinQuantTrace {
     pub run_coverage: Vec<usize>,
 }
 
+/// Enhanced protein quantification result combining MaxLFQ intensities with protein metadata.
+///
+/// This structure preserves important protein grouping information alongside the quantification
+/// results, enabling comprehensive quality control and downstream filtering based on FDR,
+/// peptide counts, and sample coverage.
+#[derive(Clone, Debug)]
+pub struct ProteinRollupResult {
+    /// Protein accessions (sorted and deduplicated)
+    pub accessions: Vec<Arc<str>>,
+    /// MaxLFQ quantification results
+    pub quant: ProteinQuantResult,
+    /// Protein-level q-value (minimum across constituent peptides)
+    pub q_value: f32,
+    /// Total peptide count before q-value filtering
+    pub total_peptide_count: usize,
+    /// Peptide count after q-value filtering
+    pub passing_peptide_count: usize,
+    /// Number of contributing peptides per run (for batch effect diagnosis)
+    pub run_coverage: Vec<usize>,
+}
+
 fn canonicalize_accessions(accessions: &mut Vec<Arc<str>>) {
     accessions.sort_unstable_by(|a, b| a.as_ref().cmp(b.as_ref()));
     accessions.dedup_by(|a, b| a.as_ref() == b.as_ref());
@@ -310,11 +331,14 @@ fn build_solver_groups(
 ///
 /// Proteins with fewer peptides than `config.min_peptides_per_ratio` are filtered
 /// out before quantification to prevent errors in the MaxLFQ solver.
+///
+/// Returns [`ProteinRollupResult`] which combines MaxLFQ intensities with protein
+/// metadata (q-value, peptide counts, run coverage) for comprehensive quality control.
 pub fn quantify_protein_groups(
     traces: &[PeptideQuantTrace],
     proteins: &BTreeMap<Vec<Arc<str>>, ProteinQuantTrace>,
     config: MaxLfqConfig,
-) -> Result<Vec<ProteinQuantResult>, MaxLfqError> {
+) -> Result<Vec<ProteinRollupResult>, MaxLfqError> {
     let mut index_lookup: FnvHashMap<PeptideIx, usize> = FnvHashMap::default();
 
     for (row, trace) in traces.iter().enumerate() {
@@ -344,7 +368,41 @@ pub fn quantify_protein_groups(
 
     log::info!("quantifying {} protein groups with MaxLFQ", groups.len());
 
-    sage_lfq::quantify_proteins(traces, &groups, config)
+    // Run MaxLFQ quantification
+    let quant_results = sage_lfq::quantify_proteins(traces, &groups, config)?;
+
+    // Zip quantification results with protein metadata
+    // Match by protein IDs to preserve all metadata
+    let mut rollup_results = Vec::with_capacity(quant_results.len());
+    
+    for quant in quant_results {
+        // Convert protein IDs to Arc<str> for lookup
+        let protein_key: Vec<Arc<str>> = quant
+            .protein_ids
+            .iter()
+            .map(|s| Arc::<str>::from(s.as_str()))
+            .collect();
+
+        // Find matching protein trace metadata
+        if let Some(trace) = proteins.get(&protein_key) {
+            rollup_results.push(ProteinRollupResult {
+                accessions: trace.accessions.clone(),
+                quant,
+                q_value: trace.q_value,
+                total_peptide_count: trace.total_peptide_count,
+                passing_peptide_count: trace.passing_peptide_count,
+                run_coverage: trace.run_coverage.clone(),
+            });
+        } else {
+            // This should never happen - quantified protein must have trace metadata
+            log::warn!(
+                "MaxLFQ quantified protein not found in traces: {:?}",
+                protein_key
+            );
+        }
+    }
+
+    Ok(rollup_results)
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

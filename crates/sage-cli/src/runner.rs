@@ -10,7 +10,7 @@ use sage_core::database::{IndexedDatabase, Parameters};
 use sage_core::fasta::Fasta;
 use sage_core::ion_series::Kind;
 use sage_core::lfq::{
-    quantify_protein_groups, MaxLfqConfig, PeptideQuantTrace, PrecursorId, ProteinQuantResult,
+    quantify_protein_groups, MaxLfqConfig, PeptideQuantTrace, PrecursorId, ProteinRollupResult,
     ProteinQuantTrace,
 };
 use sage_core::mass::Tolerance;
@@ -561,7 +561,7 @@ impl Runner {
             })
             .collect::<Vec<_>>();
 
-        let mut protein_rollup: Option<Vec<ProteinQuantResult>> = None;
+        let mut protein_rollup: Option<Vec<ProteinRollupResult>> = None;
         let areas = if let Some(alignments) = alignments {
             if self.parameters.quant.lfq {
                 log::trace!("performing LFQ");
@@ -1292,7 +1292,7 @@ impl Runner {
 
     pub fn write_lfq_proteins(
         &self,
-        proteins: &[ProteinQuantResult],
+        proteins: &[ProteinRollupResult],
         filenames: &[String],
     ) -> anyhow::Result<String> {
         let path = self.make_path("lfq_proteins.tsv");
@@ -1303,23 +1303,50 @@ impl Runner {
 
         let mut headers = csv::ByteRecord::new();
         headers.push_field(b"proteins");
-        headers.push_field(b"peptide_count");
+        headers.push_field(b"q_value");
+        headers.push_field(b"total_peptides");
+        headers.push_field(b"passing_peptides");
+        headers.push_field(b"lfq_peptide_count");
+        
+        // Intensity columns
         for name in filenames {
-            headers.push_field(name.as_bytes());
+            headers.push_field(format!("intensity:{}", name).as_bytes());
         }
+        
+        // Coverage columns (boolean: has any signal)
         for name in filenames {
             headers.push_field(format!("coverage:{}", name).as_bytes());
         }
+        
+        // Contributors columns (count of peptides)
+        for name in filenames {
+            headers.push_field(format!("contributors:{}", name).as_bytes());
+        }
+        
         wtr.write_byte_record(&headers)?;
 
         for result in proteins {
             let mut record = csv::ByteRecord::new();
-            let proteins_joined = result.protein_ids.join(";");
+            
+            // Protein accessions
+            let proteins_joined = result
+                .accessions
+                .iter()
+                .map(|s| s.as_ref())
+                .collect::<Vec<_>>()
+                .join(";");
             record.push_field(proteins_joined.as_bytes());
-            record.push_field(itoa::Buffer::new().format(result.peptide_count).as_bytes());
+            
+            // Protein metadata
+            record.push_field(ryu::Buffer::new().format(result.q_value).as_bytes());
+            record.push_field(itoa::Buffer::new().format(result.total_peptide_count).as_bytes());
+            record.push_field(itoa::Buffer::new().format(result.passing_peptide_count).as_bytes());
+            record.push_field(itoa::Buffer::new().format(result.quant.peptide_count).as_bytes());
 
+            // MaxLFQ intensities
             for sample_idx in 0..filenames.len() {
                 let intensity = result
+                    .quant
                     .lfq_intensities
                     .get(sample_idx)
                     .copied()
@@ -1327,13 +1354,25 @@ impl Runner {
                 record.push_field(ryu::Buffer::new().format(intensity).as_bytes());
             }
 
+            // Sample coverage (boolean)
             for sample_idx in 0..filenames.len() {
                 let covered = result
+                    .quant
                     .sample_coverage
                     .get(sample_idx)
                     .copied()
                     .unwrap_or(false);
                 record.push_field(if covered { b"1" } else { b"0" });
+            }
+            
+            // Contributing peptides per run
+            for sample_idx in 0..filenames.len() {
+                let contributors = result
+                    .run_coverage
+                    .get(sample_idx)
+                    .copied()
+                    .unwrap_or_default();
+                record.push_field(itoa::Buffer::new().format(contributors).as_bytes());
             }
 
             wtr.write_byte_record(&record)?;

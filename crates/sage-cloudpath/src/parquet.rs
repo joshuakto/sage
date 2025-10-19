@@ -21,7 +21,7 @@ use parquet::{
 };
 use sage_core::database::IndexedDatabase;
 use sage_core::ion_series::Kind;
-use sage_core::lfq::{PeptideQuantTrace, PrecursorId, ProteinQuantResult};
+use sage_core::lfq::{PeptideQuantTrace, PrecursorId, ProteinRollupResult};
 use sage_core::scoring::Feature;
 use sage_core::tmt::TmtQuant;
 
@@ -422,10 +422,14 @@ pub fn build_lfq_protein_schema() -> parquet::errors::Result<Type> {
     let msg = r#"
         message schema {
             required byte_array proteins (utf8);
-            required int32 peptide_count;
+            required float q_value;
+            required int32 total_peptides;
+            required int32 passing_peptides;
+            required int32 lfq_peptide_count;
             required byte_array filename (utf8);
             required float intensity;
             required boolean covered;
+            required int32 contributors;
         }
     "#;
     parquet::schema::parser::parse_message_type(msg)
@@ -561,7 +565,7 @@ pub fn serialize_lfq<H: BuildHasher>(
 }
 
 pub fn serialize_lfq_proteins(
-    proteins: &[ProteinQuantResult],
+    proteins: &[ProteinRollupResult],
     filenames: &[String],
 ) -> parquet::errors::Result<Vec<u8>> {
     let schema = build_lfq_protein_schema()?;
@@ -574,10 +578,16 @@ pub fn serialize_lfq_proteins(
     let mut writer = SerializedFileWriter::new(buf, schema.into(), options.into())?;
     let mut rg = writer.next_row_group()?;
 
+    // Column 1: proteins
     if let Some(mut col) = rg.next_column()? {
         let mut values = Vec::with_capacity(proteins.len() * filenames.len());
         for protein in proteins {
-            let joined = protein.protein_ids.join(";");
+            let joined = protein
+                .accessions
+                .iter()
+                .map(|s| s.as_ref())
+                .collect::<Vec<_>>()
+                .join(";");
             for _ in filenames {
                 values.push(ByteArray::from(joined.as_str()));
             }
@@ -587,17 +597,55 @@ pub fn serialize_lfq_proteins(
         col.close()?;
     }
 
+    // Column 2: q_value
     if let Some(mut col) = rg.next_column()? {
         let mut values = Vec::with_capacity(proteins.len() * filenames.len());
         for protein in proteins {
             for _ in filenames {
-                values.push(protein.peptide_count as i32);
+                values.push(protein.q_value);
+            }
+        }
+        col.typed::<FloatType>().write_batch(&values, None, None)?;
+        col.close()?;
+    }
+
+    // Column 3: total_peptides
+    if let Some(mut col) = rg.next_column()? {
+        let mut values = Vec::with_capacity(proteins.len() * filenames.len());
+        for protein in proteins {
+            for _ in filenames {
+                values.push(protein.total_peptide_count as i32);
             }
         }
         col.typed::<Int32Type>().write_batch(&values, None, None)?;
         col.close()?;
     }
 
+    // Column 4: passing_peptides
+    if let Some(mut col) = rg.next_column()? {
+        let mut values = Vec::with_capacity(proteins.len() * filenames.len());
+        for protein in proteins {
+            for _ in filenames {
+                values.push(protein.passing_peptide_count as i32);
+            }
+        }
+        col.typed::<Int32Type>().write_batch(&values, None, None)?;
+        col.close()?;
+    }
+
+    // Column 5: lfq_peptide_count
+    if let Some(mut col) = rg.next_column()? {
+        let mut values = Vec::with_capacity(proteins.len() * filenames.len());
+        for protein in proteins {
+            for _ in filenames {
+                values.push(protein.quant.peptide_count as i32);
+            }
+        }
+        col.typed::<Int32Type>().write_batch(&values, None, None)?;
+        col.close()?;
+    }
+
+    // Column 6: filename
     if let Some(mut col) = rg.next_column()? {
         let mut values = Vec::with_capacity(proteins.len() * filenames.len());
         for _ in proteins {
@@ -610,11 +658,13 @@ pub fn serialize_lfq_proteins(
         col.close()?;
     }
 
+    // Column 7: intensity
     if let Some(mut col) = rg.next_column()? {
         let mut values = Vec::with_capacity(proteins.len() * filenames.len());
         for protein in proteins {
             for sample_idx in 0..filenames.len() {
                 let intensity = protein
+                    .quant
                     .lfq_intensities
                     .get(sample_idx)
                     .copied()
@@ -626,11 +676,13 @@ pub fn serialize_lfq_proteins(
         col.close()?;
     }
 
+    // Column 8: covered
     if let Some(mut col) = rg.next_column()? {
         let mut values = Vec::with_capacity(proteins.len() * filenames.len());
         for protein in proteins {
             for sample_idx in 0..filenames.len() {
                 let covered = protein
+                    .quant
                     .sample_coverage
                     .get(sample_idx)
                     .copied()
@@ -639,6 +691,23 @@ pub fn serialize_lfq_proteins(
             }
         }
         col.typed::<BoolType>().write_batch(&values, None, None)?;
+        col.close()?;
+    }
+
+    // Column 9: contributors
+    if let Some(mut col) = rg.next_column()? {
+        let mut values = Vec::with_capacity(proteins.len() * filenames.len());
+        for protein in proteins {
+            for sample_idx in 0..filenames.len() {
+                let contributors = protein
+                    .run_coverage
+                    .get(sample_idx)
+                    .copied()
+                    .unwrap_or_default();
+                values.push(contributors as i32);
+            }
+        }
+        col.typed::<Int32Type>().write_batch(&values, None, None)?;
         col.close()?;
     }
 
