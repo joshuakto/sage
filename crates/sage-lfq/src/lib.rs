@@ -1,3 +1,4 @@
+mod delayed_normalization;
 pub mod error;
 pub mod matrix;
 pub mod solver;
@@ -21,9 +22,16 @@ pub fn quantify_proteins(
         .unwrap_or(0);
 
     let intensity_matrix = matrix::IntensityMatrix::from_peptide_traces(peptide_traces, n_samples);
-    
-    // Note: Normalization is handled implicitly by MaxLFQ's least-squares optimization
-    // Pre-normalization was removed as it inappropriately removed biological signal
+
+    // Compute global normalization offsets if enabled
+    let normalization = if config.use_global_normalization {
+        Some(delayed_normalization::compute_delayed_normalization(
+            &intensity_matrix,
+            config.reference_sample,
+        )?)
+    } else {
+        None
+    };
 
     let mut results = Vec::with_capacity(protein_groups.len());
 
@@ -45,7 +53,7 @@ pub fn quantify_proteins(
             return Err(MaxLfqError::InsufficientPeptides(protein_ids.join(",")));
         }
 
-        match ProteinSolver::quantify(&peptide_submatrix, &config) {
+        match ProteinSolver::quantify(&peptide_submatrix, normalization.as_deref(), &config) {
             Some(profile) => {
                 let mut sample_coverage = vec![false; intensity_matrix.n_samples];
                 for row in peptide_submatrix.outer_iterator() {
@@ -72,6 +80,19 @@ pub fn quantify_proteins(
 pub struct MaxLfqConfig {
     pub min_peptides_per_ratio: usize,  // Default: 2
     pub min_samples_for_protein: usize, // Default: 1
+    pub use_global_normalization: bool, // Default: true
+    pub reference_sample: Option<usize>, // Default: None (auto-select)
+}
+
+impl Default for MaxLfqConfig {
+    fn default() -> Self {
+        Self {
+            min_peptides_per_ratio: 2,
+            min_samples_for_protein: 1,
+            use_global_normalization: true,
+            reference_sample: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

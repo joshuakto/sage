@@ -13,4 +13,10 @@ pub enum MaxLfqError {
 
     #[error("Invalid matrix dimensions")]
     InvalidDimensions,
+
+    #[error("Failed to compute global normalization offsets")]
+    NormalizationFailed,
+
+    #[error("Invalid reference sample index: {0}")]
+    InvalidReferenceSample(usize),
 }
