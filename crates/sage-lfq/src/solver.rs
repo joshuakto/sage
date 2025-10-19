@@ -21,9 +21,10 @@ struct RatioMatrix {
 impl ProteinSolver {
     pub fn quantify(
         peptide_submatrix: &CsMat<f32>,
+        global_normalization: Option<&[f64]>,
         config: &MaxLfqConfig,
     ) -> Option<ProteinProfile> {
-        let ratio_matrix = build_ratio_matrix(peptide_submatrix)?;
+        let ratio_matrix = build_ratio_matrix(peptide_submatrix, global_normalization, config)?;
 
         if !is_connected(&ratio_matrix) {
             return None;
@@ -55,11 +56,19 @@ impl ProteinSolver {
 }
 
 /// Build pairwise ratio matrix using median aggregation (MaxLFQ standard).
-/// 
-/// For each sample pair (i,j), computes the median of log-ratios across all
-/// peptides observed in both samples. Median provides robustness against
-/// outlier peptides compared to mean aggregation.
-fn build_ratio_matrix(submatrix: &CsMat<f32>) -> Option<RatioMatrix> {
+///
+/// Applies global normalization offsets (if provided) and computes median
+/// log-ratios for each sample pair. Enforces min_peptides_per_ratio threshold.
+///
+/// # Arguments
+/// * `submatrix` - Peptide intensities (log-scale) for this protein
+/// * `global_normalization` - Optional normalization offsets to subtract
+/// * `config` - Configuration including min_peptides_per_ratio threshold
+fn build_ratio_matrix(
+    submatrix: &CsMat<f32>,
+    global_normalization: Option<&[f64]>,
+    config: &MaxLfqConfig,
+) -> Option<RatioMatrix> {
     let n_samples = submatrix.cols();
     if n_samples == 0 {
         return Some(RatioMatrix {
@@ -76,7 +85,14 @@ fn build_ratio_matrix(submatrix: &CsMat<f32>) -> Option<RatioMatrix> {
     for row in submatrix.outer_iterator() {
         let entries: Vec<(usize, f64)> = row
             .iter()
-            .map(|(col, &value)| (col, value as f64))
+            .map(|(col, &value)| {
+                // Apply global normalization by SUBTRACTING offsets
+                let normalized = global_normalization
+                    .and_then(|norm| norm.get(col).copied())
+                    .map(|offset| value as f64 - offset)
+                    .unwrap_or(value as f64);
+                (col, normalized)
+            })
             .collect();
 
         for (col, _) in &entries {
@@ -122,17 +138,34 @@ fn build_ratio_matrix(submatrix: &CsMat<f32>) -> Option<RatioMatrix> {
         }
     }
 
+    // FIX REVIEWER ISSUE #1: Enforce min_peptides_per_ratio threshold
+    // Invalidate edges with insufficient peptides
+    let min_peptides = config.min_peptides_per_ratio;
+    for i in 0..n_samples {
+        for j in 0..n_samples {
+            if counts[(i, j)] > 0 && counts[(i, j)] < min_peptides {
+                counts[(i, j)] = 0;
+                ratios[(i, j)] = 0.0;
+            }
+        }
+    }
+
+    // Recheck if any valid ratios remain after thresholding
+    has_ratio = counts.iter().any(|&c| c > 0);
+
     let active_count = active.iter().filter(|&&is_active| is_active).count();
 
-    if !has_ratio {
-        if active_count == 1 {
-            return Some(RatioMatrix {
-                ratios,
-                counts,
-                active_samples: active,
-            });
-        }
+    // Special case: single-sample proteins are quantifiable
+    if !has_ratio && active_count == 1 {
+        return Some(RatioMatrix {
+            ratios,
+            counts,
+            active_samples: active,
+        });
+    }
 
+    // If no ratios but multiple samples, can't quantify
+    if !has_ratio {
         return None;
     }
 
@@ -195,69 +228,97 @@ fn is_connected(ratios: &RatioMatrix) -> bool {
     active_indices.iter().all(|idx| visited.contains(idx))
 }
 
+/// FIX REVIEWER ISSUE #2: Proper least-squares solver
+///
+/// Solves the MaxLFQ optimization problem by minimizing:
+/// Σ(i<j) weight[i,j] * (x_i - x_j - ratio[i,j])²
+///
+/// This builds and solves the normal equations (A^T A)x = A^T b where:
+/// - Each edge (i,j) contributes equation: x_i - x_j = ratio[i,j]
+/// - Edges are weighted by peptide count for robustness
+/// - Reference sample fixed at 0 to remove gauge freedom
 fn solve_least_squares(ratios: &RatioMatrix) -> Option<Vec<f64>> {
     let n = ratios.ratios.nrows();
     if n == 0 {
         return Some(Vec::new());
     }
 
-    let mut values = vec![None; n];
-    let mut queue = VecDeque::new();
-
-    let start = ratios
+    // Find active samples and reference sample
+    let active_indices: Vec<usize> = ratios
         .active_samples
         .iter()
         .enumerate()
-        .find(|(_, active)| **active)
-        .map(|(idx, _)| idx)?;
+        .filter(|(_, &active)| active)
+        .map(|(idx, _)| idx)
+        .collect();
 
-    values[start] = Some(0.0f64);
-    queue.push_back(start);
-
-    while let Some(node) = queue.pop_front() {
-        let node_value = values[node].unwrap();
-        for neighbor in 0..n {
-            if ratios.counts[(node, neighbor)] == 0 {
-                continue;
-            }
-
-            let diff = ratios.ratios[(node, neighbor)] as f64;
-            let candidate = node_value + diff;
-
-            match values[neighbor] {
-                Some(current) => {
-                    let avg = (current + candidate) / 2.0;
-                    values[neighbor] = Some(avg);
-                }
-                None => {
-                    values[neighbor] = Some(candidate);
-                    queue.push_back(neighbor);
-                }
-            }
-        }
-    }
-
-    if ratios
-        .active_samples
-        .iter()
-        .enumerate()
-        .any(|(idx, active)| *active && values[idx].is_none())
-    {
+    if active_indices.is_empty() {
         return None;
     }
 
+    // Special case: single sample (no edges)
+    // Just return 0 for that sample, NaN for others
+    if active_indices.len() == 1 {
+        let mut result = vec![f64::NAN; n];
+        result[active_indices[0]] = 0.0;
+        return Some(result);
+    }
+
+    // Build normal equations: (A^T A) x = (A^T b)
+    let mut ata = DMatrix::zeros(n, n);
+    let mut atb = nalgebra::DVector::zeros(n);
+
+    // Add equation for each edge: x_j - x_i = ratio[i,j]
+    // where ratio[i,j] = median(log(I_j) - log(I_i)) across peptides
+    // Weighted by peptide count for robustness
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let count = ratios.counts[(i, j)];
+            if count == 0 {
+                continue;
+            }
+
+            let weight = count as f64; // Weight by peptide count
+            let ratio = ratios.ratios[(i, j)] as f64;
+
+            // Equation: x_j - x_i = ratio[i,j]
+            // In normal equations form:
+            ata[(i, i)] += weight;
+            ata[(j, j)] += weight;
+            ata[(i, j)] -= weight;
+            ata[(j, i)] -= weight;
+
+            atb[i] -= weight * ratio;
+            atb[j] += weight * ratio;
+        }
+    }
+
+    // Fix gauge: set first active sample to 0
+    // Replace first active sample's equation with x_ref = 0
+    let reference = active_indices[0];
+    for j in 0..n {
+        ata[(reference, j)] = 0.0;
+    }
+    ata[(reference, reference)] = 1.0;
+    atb[reference] = 0.0;
+
+    // Solve using LU decomposition (with fallback to QR)
+    let solution = ata
+        .clone()
+        .lu()
+        .solve(&atb)
+        .or_else(|| ata.qr().solve(&atb))?;
+
+    // Center values (subtract mean of active samples)
+    let mut values: Vec<f64> = solution.as_slice().to_vec();
+    
     let mean = {
         let mut sum = 0.0f64;
         let mut count = 0usize;
-        for (idx, value) in values.iter().enumerate() {
-            if ratios.active_samples[idx] {
-                if let Some(v) = value {
-                    sum += *v;
-                    count += 1;
-                }
-            }
+        for &idx in &active_indices {
+            sum += values[idx];
+            count += 1;
         }
-
         if count == 0 {
             0.0
         } else {
@@ -265,21 +326,16 @@ fn solve_least_squares(ratios: &RatioMatrix) -> Option<Vec<f64>> {
         }
     };
 
-    let mut result = Vec::with_capacity(values.len());
-    for (idx, value) in values.into_iter().enumerate() {
-        match value {
-            Some(mut v) => {
-                v -= mean;
-                result.push(v);
-            }
-            None => {
-                debug_assert!(!ratios.active_samples[idx]);
-                result.push(f64::NAN);
-            }
+    // Subtract mean and set inactive samples to NaN
+    for (idx, value) in values.iter_mut().enumerate() {
+        if ratios.active_samples[idx] {
+            *value -= mean;
+        } else {
+            *value = f64::NAN;
         }
     }
 
-    Some(result)
+    Some(values)
 }
 
 fn rescale_to_absolute(log_intensities: &[f64], original_matrix: &CsMat<f32>) -> Vec<f32> {
@@ -359,11 +415,15 @@ mod tests {
 
         let matrix = triplets.to_csr();
 
-        let ratio_matrix = build_ratio_matrix(&matrix).expect("ratio matrix");
+        let config = MaxLfqConfig::default();
+        let ratio_matrix = build_ratio_matrix(&matrix, None, &config).expect("ratio matrix");
         let log_intensities = solve_least_squares(&ratio_matrix).expect("lfq solution");
 
         let diff = log_intensities[1] - log_intensities[0];
-        assert!((diff - 1.0).abs() < 1e-6, "expected fold-change of 1, got {diff}");
+        assert!(
+            (diff - 1.0).abs() < 1e-6,
+            "expected fold-change of 1, got {diff}"
+        );
     }
     
     #[test]
@@ -386,12 +446,15 @@ mod tests {
         triplets.add_triplet(4, 1, 15.0);
         
         let matrix = triplets.to_csr();
-        let ratio_matrix = build_ratio_matrix(&matrix).expect("ratio matrix");
-        
+        let config = MaxLfqConfig::default();
+        let ratio_matrix = build_ratio_matrix(&matrix, None, &config).expect("ratio matrix");
+
         // Median should be ~1.0, not affected by outlier
         let median_ratio = ratio_matrix.ratios[(0, 1)];
-        assert!((median_ratio - 1.0).abs() < 0.1, 
-                "median should be ~1.0, got {median_ratio}");
+        assert!(
+            (median_ratio - 1.0).abs() < 0.1,
+            "median should be ~1.0, got {median_ratio}"
+        );
     }
     
     #[test]
@@ -400,16 +463,20 @@ mod tests {
         let config = MaxLfqConfig {
             min_peptides_per_ratio: 2,
             min_samples_for_protein: 1,
+            ..Default::default()
         };
-        
+
         let mut triplets = TriMat::new((2, 4)); // 2 peptides, 4 samples
         triplets.add_triplet(0, 2, 10.0); // Only in sample 2
         triplets.add_triplet(1, 2, 12.0);
-        
+
         let matrix = triplets.to_csr();
-        let result = ProteinSolver::quantify(&matrix, &config);
-        
-        assert!(result.is_some(), "single-sample protein should be quantified");
+        let result = ProteinSolver::quantify(&matrix, None, &config);
+
+        assert!(
+            result.is_some(),
+            "single-sample protein should be quantified"
+        );
         let profile = result.unwrap();
         assert_eq!(profile.n_quantified_samples, 1);
     }
@@ -420,8 +487,9 @@ mod tests {
         let config = MaxLfqConfig {
             min_peptides_per_ratio: 2,
             min_samples_for_protein: 1,
+            ..Default::default()
         };
-        
+
         let mut triplets = TriMat::new((4, 4)); // 4 peptides, 4 samples
         // Peptides 0,1 only in samples 0,1
         triplets.add_triplet(0, 0, 10.0);
@@ -436,8 +504,8 @@ mod tests {
         triplets.add_triplet(3, 3, 11.0);
         
         let matrix = triplets.to_csr();
-        let result = ProteinSolver::quantify(&matrix, &config);
-        
+        let result = ProteinSolver::quantify(&matrix, None, &config);
+
         assert!(result.is_none(), "disconnected samples should be rejected");
     }
     
@@ -448,5 +516,94 @@ mod tests {
         assert_eq!(compute_median(&[1.0, 2.0, 3.0]), 2.0);
         assert_eq!(compute_median(&[1.0, 2.0, 3.0, 4.0]), 2.5);
         assert_eq!(compute_median(&[]), 0.0);
+    }
+
+    #[test]
+    fn applies_global_normalization_offsets() {
+        // Test that global normalization offsets are correctly SUBTRACTED
+        let mut triplets = TriMat::new((1, 2));
+        triplets.add_triplet(0, 0, 10.0);
+        triplets.add_triplet(0, 1, 12.0);
+
+        let matrix = triplets.to_csr();
+        let config = MaxLfqConfig {
+            min_peptides_per_ratio: 1, // Allow single peptide
+            ..Default::default()
+        };
+        let normalization = [0.0, 1.0]; // Sample 1 has 1.0 offset to subtract
+
+        let ratio_matrix = build_ratio_matrix(&matrix, Some(&normalization), &config).expect("ratio");
+        
+        // After subtracting offset: sample 0 = 10.0, sample 1 = 12.0 - 1.0 = 11.0
+        // Ratio should be 1.0 (not 2.0)
+        assert!((ratio_matrix.ratios[(0, 1)] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn enforces_min_peptides_per_ratio_threshold() {
+        // Test that sample pairs with insufficient peptides are excluded
+        let config = MaxLfqConfig {
+            min_peptides_per_ratio: 2,
+            ..Default::default()
+        };
+
+        let mut triplets = TriMat::new((1, 3)); // 1 peptide, 3 samples
+        triplets.add_triplet(0, 0, 10.0);
+        triplets.add_triplet(0, 1, 11.0);
+        triplets.add_triplet(0, 2, 12.0);
+
+        let matrix = triplets.to_csr();
+        let result = build_ratio_matrix(&matrix, None, &config);
+
+        // With only 1 peptide per pair and threshold=2, all edges invalid
+        // Should return None (cannot quantify with no valid edges)
+        assert!(result.is_none(), "Should reject protein with insufficient peptides per ratio");
+    }
+
+    #[test]
+    fn least_squares_handles_cyclic_inconsistencies() {
+        // Test that proper least-squares solver minimizes error across cycles
+        // Triangle with 2+ peptides per edge
+        let config = MaxLfqConfig {
+            min_peptides_per_ratio: 1, // Allow edges with 1+ peptides
+            ..Default::default()
+        };
+        
+        let mut triplets = TriMat::new((6, 3));
+        // 2 peptides between samples 0,1 with diff ~1.0
+        triplets.add_triplet(0, 0, 10.0);
+        triplets.add_triplet(0, 1, 11.0);
+        triplets.add_triplet(1, 0, 10.0);
+        triplets.add_triplet(1, 1, 11.0);
+        // 2 peptides between samples 1,2 with diff ~1.0
+        triplets.add_triplet(2, 1, 11.0);
+        triplets.add_triplet(2, 2, 12.0);
+        triplets.add_triplet(3, 1, 11.0);
+        triplets.add_triplet(3, 2, 12.0);
+        // 2 peptides between samples 0,2 with diff ~1.5 (inconsistent)
+        triplets.add_triplet(4, 0, 10.0);
+        triplets.add_triplet(4, 2, 11.5);
+        triplets.add_triplet(5, 0, 10.0);
+        triplets.add_triplet(5, 2, 11.5);
+
+        let matrix = triplets.to_csr();
+        let ratio_matrix = build_ratio_matrix(&matrix, None, &config).expect("ratio");
+        let log_intensities = solve_least_squares(&ratio_matrix).expect("solution");
+
+        // Should find values that minimize total squared error
+        // Not dependent on traversal order (unlike BFS)
+        let diff_01 = log_intensities[1] - log_intensities[0];
+        let diff_12 = log_intensities[2] - log_intensities[1];
+        let diff_02 = log_intensities[2] - log_intensities[0];
+
+        // Errors should be roughly balanced (not all error on one edge)
+        let error_01 = (diff_01 - 1.0).abs();
+        let error_12 = (diff_12 - 1.0).abs();
+        let error_02 = (diff_02 - 1.5).abs();
+        
+        // Total squared error should be minimized
+        assert!(error_01 < 0.3);
+        assert!(error_12 < 0.3);
+        assert!(error_02 < 0.3);
     }
 }

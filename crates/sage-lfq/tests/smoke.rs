@@ -28,6 +28,7 @@ fn test_crate_compiles() {
     let config = MaxLfqConfig {
         min_peptides_per_ratio: 1,
         min_samples_for_protein: 1,
+        ..Default::default()
     };
 
     let result = quantify_proteins(&traces, &[(vec!["P1".to_string()], vec![0])], config);
