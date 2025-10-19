@@ -10,10 +10,13 @@ use crate::ml::{matrix::Matrix, retention_alignment::Alignment};
 use crate::scoring::Feature;
 use crate::spectrum::MS1Spectra;
 use dashmap::DashMap;
+use fnv::FnvHashMap;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+
+pub use sage_lfq::{MaxLfqConfig, MaxLfqError, ProteinQuantResult};
 
 /// Minimum normalized spectral angle required to integrate a peak
 // const MIN_SPECTRAL_ANGLE: f64 = 0.70;
@@ -57,6 +60,16 @@ pub struct PeptideQuantTrace {
     pub raw_isotope_traces: Matrix,
     pub isotopic_distribution: [f32; N_ISOTOPES],
     pub time_warps: Vec<isize>,
+}
+
+impl sage_lfq::QuantTrace for PeptideQuantTrace {
+    fn intensities(&self) -> &[f64] {
+        &self.intensities
+    }
+
+    fn peptide_index(&self) -> usize {
+        self.peptide.0 as usize
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -203,9 +216,7 @@ impl ProteinQuantTrace {
                     peptide
                         .proteins
                         .iter()
-                        .map(|acc| {
-                            Arc::<str>::from(format!("{}{}#TRACE", decoy_tag, acc.as_ref()))
-                        })
+                        .map(|acc| Arc::<str>::from(format!("{}{}#TRACE", decoy_tag, acc.as_ref())))
                         .collect()
                 }
                 (false, false) => peptide.proteins.clone(),
@@ -248,6 +259,69 @@ impl ProteinQuantTrace {
     ) -> impl Iterator<Item = &'a ProteinQuantTrace> + 'a {
         proteins.values()
     }
+}
+
+fn build_solver_groups(
+    index_lookup: &FnvHashMap<PeptideIx, usize>,
+    proteins: &BTreeMap<Vec<Arc<str>>, ProteinQuantTrace>,
+) -> Vec<(Vec<String>, Vec<usize>)> {
+    ProteinQuantTrace::ordered_groups(proteins)
+        .filter_map(|(accessions, trace)| {
+            if trace.decoy {
+                return None;
+            }
+
+            let mut peptide_indices: Vec<usize> = trace
+                .peptide_indices
+                .iter()
+                .filter_map(|ix| index_lookup.get(ix).copied())
+                .collect();
+
+            if peptide_indices.is_empty() {
+                return None;
+            }
+
+            peptide_indices.sort_unstable();
+
+            let accession_strings = accessions
+                .iter()
+                .map(|acc| acc.as_ref().to_string())
+                .collect::<Vec<_>>();
+
+            Some((accession_strings, peptide_indices))
+        })
+        .collect()
+}
+
+/// Convert protein-level quantification traces into MaxLFQ protein roll-up results.
+///
+/// The helper prepares the deterministic `(Vec<String>, Vec<usize>)` tuples required
+/// by [`sage_lfq::quantify_proteins`] by resolving each peptide identifier to the
+/// corresponding position inside the provided [`PeptideQuantTrace`] slice. Protein
+/// groups flagged as decoys or without any matched peptides are ignored so the
+/// downstream solver only evaluates target proteins with usable evidence.
+pub fn quantify_protein_groups(
+    traces: &[PeptideQuantTrace],
+    proteins: &BTreeMap<Vec<Arc<str>>, ProteinQuantTrace>,
+    config: MaxLfqConfig,
+) -> Result<Vec<ProteinQuantResult>, MaxLfqError> {
+    let mut index_lookup: FnvHashMap<PeptideIx, usize> = FnvHashMap::default();
+
+    for (row, trace) in traces.iter().enumerate() {
+        if trace.decoy {
+            continue;
+        }
+
+        index_lookup.entry(trace.peptide).or_insert(row);
+    }
+
+    let groups = build_solver_groups(&index_lookup, proteins);
+
+    if groups.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    sage_lfq::quantify_proteins(traces, &groups, config)
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

@@ -21,7 +21,7 @@ use parquet::{
 };
 use sage_core::database::IndexedDatabase;
 use sage_core::ion_series::Kind;
-use sage_core::lfq::{PeptideQuantTrace, PrecursorId};
+use sage_core::lfq::{PeptideQuantTrace, PrecursorId, ProteinQuantResult};
 use sage_core::scoring::Feature;
 use sage_core::tmt::TmtQuant;
 
@@ -418,6 +418,19 @@ pub fn build_lfq_schema() -> parquet::errors::Result<Type> {
     parquet::schema::parser::parse_message_type(msg)
 }
 
+pub fn build_lfq_protein_schema() -> parquet::errors::Result<Type> {
+    let msg = r#"
+        message schema {
+            required byte_array proteins (utf8);
+            required int32 peptide_count;
+            required byte_array filename (utf8);
+            required float intensity;
+            required boolean covered;
+        }
+    "#;
+    parquet::schema::parser::parse_message_type(msg)
+}
+
 pub fn serialize_lfq<H: BuildHasher>(
     areas: &HashMap<(PrecursorId, bool), PeptideQuantTrace, H>,
     filenames: &[String],
@@ -547,6 +560,92 @@ pub fn serialize_lfq<H: BuildHasher>(
     writer.into_inner()
 }
 
+pub fn serialize_lfq_proteins(
+    proteins: &[ProteinQuantResult],
+    filenames: &[String],
+) -> parquet::errors::Result<Vec<u8>> {
+    let schema = build_lfq_protein_schema()?;
+
+    let options = WriterProperties::builder()
+        .set_compression(parquet::basic::Compression::ZSTD(ZstdLevel::try_new(3)?))
+        .build();
+
+    let buf = Vec::new();
+    let mut writer = SerializedFileWriter::new(buf, schema.into(), options.into())?;
+    let mut rg = writer.next_row_group()?;
+
+    if let Some(mut col) = rg.next_column()? {
+        let mut values = Vec::with_capacity(proteins.len() * filenames.len());
+        for protein in proteins {
+            let joined = protein.protein_ids.join(";");
+            for _ in filenames {
+                values.push(ByteArray::from(joined.as_str()));
+            }
+        }
+        col.typed::<ByteArrayType>()
+            .write_batch(&values, None, None)?;
+        col.close()?;
+    }
+
+    if let Some(mut col) = rg.next_column()? {
+        let mut values = Vec::with_capacity(proteins.len() * filenames.len());
+        for protein in proteins {
+            for _ in filenames {
+                values.push(protein.peptide_count as i32);
+            }
+        }
+        col.typed::<Int32Type>().write_batch(&values, None, None)?;
+        col.close()?;
+    }
+
+    if let Some(mut col) = rg.next_column()? {
+        let mut values = Vec::with_capacity(proteins.len() * filenames.len());
+        for _ in proteins {
+            for filename in filenames {
+                values.push(filename.as_bytes().into());
+            }
+        }
+        col.typed::<ByteArrayType>()
+            .write_batch(&values, None, None)?;
+        col.close()?;
+    }
+
+    if let Some(mut col) = rg.next_column()? {
+        let mut values = Vec::with_capacity(proteins.len() * filenames.len());
+        for protein in proteins {
+            for sample_idx in 0..filenames.len() {
+                let intensity = protein
+                    .lfq_intensities
+                    .get(sample_idx)
+                    .copied()
+                    .unwrap_or_default();
+                values.push(intensity);
+            }
+        }
+        col.typed::<FloatType>().write_batch(&values, None, None)?;
+        col.close()?;
+    }
+
+    if let Some(mut col) = rg.next_column()? {
+        let mut values = Vec::with_capacity(proteins.len() * filenames.len());
+        for protein in proteins {
+            for sample_idx in 0..filenames.len() {
+                let covered = protein
+                    .sample_coverage
+                    .get(sample_idx)
+                    .copied()
+                    .unwrap_or(false);
+                values.push(covered);
+            }
+        }
+        col.typed::<BoolType>().write_batch(&values, None, None)?;
+        col.close()?;
+    }
+
+    rg.close()?;
+    writer.into_inner()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -557,7 +656,7 @@ mod tests {
     use parquet::record::{Field, RowAccessor};
     use sage_core::database::PeptideIx;
     use sage_core::enzyme::Position;
-    use sage_core::lfq::Peak;
+    use sage_core::lfq::{Peak, ProteinQuantResult};
     use sage_core::ml::matrix::Matrix;
     use sage_core::peptide::Peptide;
     use std::hash::BuildHasherDefault;
@@ -670,15 +769,16 @@ mod tests {
                 let stripped = std::str::from_utf8(&database[trace.peptide].sequence)
                     .unwrap()
                     .to_owned();
-                filenames.iter().zip(trace.intensities.iter()).map(move |(file, intensity)| {
-                    ExpectedRow {
+                filenames
+                    .iter()
+                    .zip(trace.intensities.iter())
+                    .map(move |(file, intensity)| ExpectedRow {
                         peptide: peptide.clone(),
                         stripped: stripped.clone(),
                         precursor: *precursor,
                         filename: file.clone(),
                         intensity: *intensity as f32,
-                    }
-                })
+                    })
             })
             .collect();
 
@@ -719,7 +819,9 @@ mod tests {
         let num_rows = row_group.metadata().num_rows() as usize;
         assert_eq!(num_rows, expected_rows.len());
 
-        if let ColumnReader::Int32ColumnReader(mut charge_reader) = row_group.get_column_reader(2)? {
+        if let ColumnReader::Int32ColumnReader(mut charge_reader) =
+            row_group.get_column_reader(2)?
+        {
             let mut def_levels = Vec::with_capacity(num_rows);
             let mut charge_values = Vec::with_capacity(num_rows);
             let mut def_batch = Vec::with_capacity(num_rows);
@@ -833,6 +935,38 @@ mod tests {
         } else {
             panic!("intensity column reader not available");
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn serialize_lfq_proteins_round_trip() -> parquet::errors::Result<()> {
+        let filenames = vec!["run_a".to_string(), "run_b".to_string()];
+        let proteins = vec![ProteinQuantResult {
+            protein_ids: vec!["P1".to_string(), "P2".to_string()],
+            lfq_intensities: vec![123.0, 456.0],
+            peptide_count: 3,
+            sample_coverage: vec![true, false],
+        }];
+
+        let parquet_buffer = serialize_lfq_proteins(&proteins, &filenames)?;
+        let reader = SerializedFileReader::new(Bytes::from(parquet_buffer))?;
+        let mut rows = reader.get_row_iter(None)?;
+
+        let first = rows.next().expect("protein row")?;
+        assert_eq!(first.get_string(0)?, "P1;P2");
+        assert_eq!(first.get_int(1)?, 3);
+        assert_eq!(first.get_string(2)?, "run_a");
+        assert!((first.get_float(3)? - 123.0).abs() < f32::EPSILON);
+        assert!(first.get_bool(4)?);
+
+        let second = rows.next().expect("second protein row")?;
+        assert_eq!(second.get_string(0)?, "P1;P2");
+        assert_eq!(second.get_string(2)?, "run_b");
+        assert!((second.get_float(3)? - 456.0).abs() < f32::EPSILON);
+        assert!(!second.get_bool(4)?);
+
+        assert!(rows.next().is_none());
 
         Ok(())
     }

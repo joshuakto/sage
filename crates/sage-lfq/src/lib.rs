@@ -7,18 +7,24 @@ pub use error::MaxLfqError;
 pub use matrix::IntensityMatrix;
 pub use solver::ProteinProfile;
 
-use sage_core::lfq::PeptideQuantTrace;
 use solver::ProteinSolver;
 
+/// Trait representing the minimal interface required to build LFQ intensity matrices
+/// from peptide-level quantification traces.
+pub trait QuantTrace {
+    fn intensities(&self) -> &[f64];
+    fn peptide_index(&self) -> usize;
+}
+
 /// Main entry point for MaxLFQ quantification
-pub fn quantify_proteins(
-    peptide_traces: &[PeptideQuantTrace],
+pub fn quantify_proteins<T: QuantTrace>(
+    peptide_traces: &[T],
     protein_groups: &[(Vec<String>, Vec<usize>)], // (protein_ids, peptide_indices)
     config: MaxLfqConfig,
 ) -> Result<Vec<ProteinQuantResult>, MaxLfqError> {
     let n_samples = peptide_traces
         .first()
-        .map(|trace| trace.intensities.len())
+        .map(|trace| trace.intensities().len())
         .unwrap_or(0);
 
     let intensity_matrix = matrix::IntensityMatrix::from_peptide_traces(peptide_traces, n_samples);
@@ -78,9 +84,9 @@ pub fn quantify_proteins(
 
 #[derive(Debug, Clone)]
 pub struct MaxLfqConfig {
-    pub min_peptides_per_ratio: usize,  // Default: 2
-    pub min_samples_for_protein: usize, // Default: 1
-    pub use_global_normalization: bool, // Default: true
+    pub min_peptides_per_ratio: usize,   // Default: 2
+    pub min_samples_for_protein: usize,  // Default: 1
+    pub use_global_normalization: bool,  // Default: true
     pub reference_sample: Option<usize>, // Default: None (auto-select)
 }
 

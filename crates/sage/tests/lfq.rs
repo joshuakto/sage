@@ -15,16 +15,17 @@ fn build_database() -> sage_core::database::IndexedDatabase {
         ..Default::default()
     };
 
-    let fasta = Fasta::parse(
-        ">TGT\nPEPTIDE\n".into(),
-        "rev_",
-        false,
-    );
+    let fasta = Fasta::parse(">TGT\nPEPTIDE\n".into(), "rev_", false);
 
     builder.make_parameters().build(fasta)
 }
 
-fn feature_for(peptide_idx: PeptideIx, calcmass: f32, file_id: usize, peptide_len: usize) -> Feature {
+fn feature_for(
+    peptide_idx: PeptideIx,
+    calcmass: f32,
+    file_id: usize,
+    peptide_len: usize,
+) -> Feature {
     Feature {
         peptide_idx,
         psm_id: 1,
@@ -81,7 +82,11 @@ fn assert_non_empty(matrix: &Matrix) {
 #[test]
 fn quantify_emits_target_and_decoy_traces() {
     let database = build_database();
-    assert_eq!(database.peptides.len(), 2, "expected 1 target and 1 decoy peptide");
+    assert_eq!(
+        database.peptides.len(),
+        2,
+        "expected 1 target and 1 decoy peptide"
+    );
 
     let (target_ix, target) = database
         .peptides
@@ -91,12 +96,7 @@ fn quantify_emits_target_and_decoy_traces() {
         .map(|(idx, peptide)| (PeptideIx(idx as u32), peptide))
         .expect("missing target peptide");
 
-    let feature = feature_for(
-        target_ix,
-        target.monoisotopic,
-        0,
-        target.sequence.len(),
-    );
+    let feature = feature_for(target_ix, target.monoisotopic, 0, target.sequence.len());
 
     let settings = LfqSettings {
         combine_charge_states: true,

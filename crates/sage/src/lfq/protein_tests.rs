@@ -3,13 +3,51 @@ use std::sync::Arc;
 use crate::{
     database::{IndexedDatabase, PeptideIx},
     enzyme::Position,
-    lfq::{Peak, PeptideQuantTrace, PrecursorId, ProteinQuantTrace},
+    lfq::{
+        quantify_protein_groups, MaxLfqConfig, Peak, PeptideQuantTrace, PrecursorId,
+        ProteinQuantTrace,
+    },
     ml::matrix::Matrix,
     peptide::Peptide,
 };
 
 trait IndexedDatabaseProteinsExt {
     fn proteins(&self, ix: PeptideIx) -> Vec<Arc<str>>;
+}
+
+#[test]
+fn quantify_protein_groups_converts_peptides() {
+    let run_count = 2;
+    let db = fake_database(vec![
+        fake_peptide("PEPA", &["P12345"], false),
+        fake_peptide("PEPB", &["P12345"], false),
+    ]);
+
+    let traces = vec![
+        fake_trace(0, false, 0.005, &[100.0, 50.0]),
+        fake_trace(1, false, 0.007, &[10.0, 0.0]),
+    ];
+
+    let groups = ProteinQuantTrace::group_by_accession(&db, &traces, run_count, 0.01);
+
+    let results = quantify_protein_groups(
+        &traces,
+        &groups,
+        MaxLfqConfig {
+            min_peptides_per_ratio: 1,
+            min_samples_for_protein: 1,
+            use_global_normalization: false,
+            reference_sample: None,
+        },
+    )
+    .expect("protein rollup");
+
+    assert_eq!(results.len(), 1);
+    let protein = &results[0];
+    assert_eq!(protein.protein_ids, vec!["P12345".to_string()]);
+    assert_eq!(protein.peptide_count, 2);
+    assert_eq!(protein.sample_coverage.len(), run_count);
+    assert!(protein.sample_coverage[0]);
 }
 
 impl IndexedDatabaseProteinsExt for IndexedDatabase {
@@ -196,8 +234,10 @@ fn fasta_provided_decoys_keep_traces_and_peptides_separate() {
     assert_eq!(target.peptide_indices, vec![PeptideIx(0)]);
     assert_eq!(target.run_coverage, vec![1, 1]);
 
-    let trace_decoy_accession =
-        vec![Arc::<str>::from(format!("{}{}#TRACE", db.decoy_tag, "P12345"))];
+    let trace_decoy_accession = vec![Arc::<str>::from(format!(
+        "{}{}#TRACE",
+        db.decoy_tag, "P12345"
+    ))];
     let trace_decoy = proteins
         .get(&trace_decoy_accession)
         .expect("synthetic decoy protein missing");
@@ -247,8 +287,10 @@ fn synthetic_trace_decoys_do_not_merge_with_fasta_decoys() {
         .expect("target protein missing");
     assert_eq!(target.intensities, vec![80.0, 20.0]);
 
-    let trace_decoy_accession =
-        vec![Arc::<str>::from(format!("{}{}#TRACE", db.decoy_tag, "P12345"))];
+    let trace_decoy_accession = vec![Arc::<str>::from(format!(
+        "{}{}#TRACE",
+        db.decoy_tag, "P12345"
+    ))];
     let trace_decoy = proteins
         .get(&trace_decoy_accession)
         .expect("synthetic trace decoy missing");
@@ -288,8 +330,10 @@ fn decoy_traces_for_target_peptides_form_separate_groups() {
     assert_eq!(target.total_peptide_count, 1);
     assert_eq!(target.passing_peptide_count, 1);
 
-    let decoy_accession =
-        vec![Arc::<str>::from(format!("{}{}#TRACE", db.decoy_tag, "P12345"))];
+    let decoy_accession = vec![Arc::<str>::from(format!(
+        "{}{}#TRACE",
+        db.decoy_tag, "P12345"
+    ))];
     let decoy = proteins
         .get(&decoy_accession)
         .expect("decoy protein missing");
