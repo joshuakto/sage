@@ -1,11 +1,9 @@
 pub mod error;
 pub mod matrix;
-pub mod normalization;
 pub mod solver;
 
 pub use error::MaxLfqError;
 pub use matrix::IntensityMatrix;
-pub use normalization::NormalizationFactors;
 pub use solver::ProteinProfile;
 
 use sage_core::lfq::PeptideQuantTrace;
