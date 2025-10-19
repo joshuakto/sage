@@ -50,6 +50,44 @@ fn quantify_protein_groups_converts_peptides() {
     assert!(protein.sample_coverage[0]);
 }
 
+#[test]
+fn single_peptide_proteins_are_filtered_not_fatal() {
+    let run_count = 2;
+    let db = fake_database(vec![
+        fake_peptide("SINGLE", &["P11111"], false),    // Single-peptide protein
+        fake_peptide("MULTI_A", &["P22222"], false),   // Multi-peptide protein
+        fake_peptide("MULTI_B", &["P22222"], false),
+    ]);
+
+    let traces = vec![
+        fake_trace(0, false, 0.005, &[100.0, 50.0]),
+        fake_trace(1, false, 0.006, &[200.0, 150.0]),
+        fake_trace(2, false, 0.007, &[300.0, 250.0]),
+    ];
+
+    let groups = ProteinQuantTrace::group_by_accession(&db, &traces, run_count, 0.01);
+    assert_eq!(groups.len(), 2); // Both proteins initially grouped
+
+    // With min_peptides=2, single-peptide protein should be filtered, not cause error
+    let results = quantify_protein_groups(
+        &traces,
+        &groups,
+        MaxLfqConfig {
+            min_peptides_per_ratio: 2,
+            min_samples_for_protein: 1,
+            use_global_normalization: false,
+            reference_sample: None,
+        },
+    )
+    .expect("should not fail on single-peptide proteins");
+
+    // Only the multi-peptide protein should be quantified
+    assert_eq!(results.len(), 1);
+    let protein = &results[0];
+    assert_eq!(protein.protein_ids, vec!["P22222".to_string()]);
+    assert_eq!(protein.peptide_count, 2);
+}
+
 impl IndexedDatabaseProteinsExt for IndexedDatabase {
     fn proteins(&self, ix: PeptideIx) -> Vec<Arc<str>> {
         self.peptides[ix.0 as usize].proteins.clone()

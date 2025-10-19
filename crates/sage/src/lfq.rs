@@ -264,6 +264,7 @@ impl ProteinQuantTrace {
 fn build_solver_groups(
     index_lookup: &FnvHashMap<PeptideIx, usize>,
     proteins: &BTreeMap<Vec<Arc<str>>, ProteinQuantTrace>,
+    config: &MaxLfqConfig,
 ) -> Vec<(Vec<String>, Vec<usize>)> {
     ProteinQuantTrace::ordered_groups(proteins)
         .filter_map(|(accessions, trace)| {
@@ -278,6 +279,12 @@ fn build_solver_groups(
                 .collect();
 
             if peptide_indices.is_empty() {
+                return None;
+            }
+
+            // Filter proteins that don't meet minimum peptide threshold
+            // This prevents InsufficientPeptides errors in the MaxLFQ solver
+            if peptide_indices.len() < config.min_peptides_per_ratio {
                 return None;
             }
 
@@ -300,6 +307,9 @@ fn build_solver_groups(
 /// corresponding position inside the provided [`PeptideQuantTrace`] slice. Protein
 /// groups flagged as decoys or without any matched peptides are ignored so the
 /// downstream solver only evaluates target proteins with usable evidence.
+///
+/// Proteins with fewer peptides than `config.min_peptides_per_ratio` are filtered
+/// out before quantification to prevent errors in the MaxLFQ solver.
 pub fn quantify_protein_groups(
     traces: &[PeptideQuantTrace],
     proteins: &BTreeMap<Vec<Arc<str>>, ProteinQuantTrace>,
@@ -315,11 +325,24 @@ pub fn quantify_protein_groups(
         index_lookup.entry(trace.peptide).or_insert(row);
     }
 
-    let groups = build_solver_groups(&index_lookup, proteins);
+    let total_proteins = proteins.len();
+    let groups = build_solver_groups(&index_lookup, proteins, &config);
+    let filtered_count = total_proteins - groups.len();
+
+    if filtered_count > 0 {
+        log::info!(
+            "filtered {} protein groups (< {} peptides per protein)",
+            filtered_count,
+            config.min_peptides_per_ratio
+        );
+    }
 
     if groups.is_empty() {
+        log::warn!("no protein groups passed min_peptides filter");
         return Ok(Vec::new());
     }
+
+    log::info!("quantifying {} protein groups with MaxLFQ", groups.len());
 
     sage_lfq::quantify_proteins(traces, &groups, config)
 }
