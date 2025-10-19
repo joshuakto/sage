@@ -264,9 +264,16 @@ fn solve_least_squares(ratios: &RatioMatrix) -> Option<Vec<f64>> {
         return Some(result);
     }
 
-    // Build normal equations: (A^T A) x = (A^T b)
-    let mut ata = DMatrix::zeros(n, n);
-    let mut atb = nalgebra::DVector::zeros(n);
+    // Build normal equations over active samples only to avoid singular matrix
+    // Map: global index -> position in active_indices
+    let m = active_indices.len();
+    let mut index_map = vec![None; n];
+    for (pos, &idx) in active_indices.iter().enumerate() {
+        index_map[idx] = Some(pos);
+    }
+
+    let mut ata = DMatrix::zeros(m, m);
+    let mut atb = nalgebra::DVector::zeros(m);
 
     // Add equation for each edge: x_j - x_i = ratio[i,j]
     // where ratio[i,j] = median(log(I_j) - log(I_i)) across peptides
@@ -278,29 +285,33 @@ fn solve_least_squares(ratios: &RatioMatrix) -> Option<Vec<f64>> {
                 continue;
             }
 
+            // Map to active indices
+            let Some(i_pos) = index_map[i] else { continue };
+            let Some(j_pos) = index_map[j] else { continue };
+
             let weight = count as f64; // Weight by peptide count
             let ratio = ratios.ratios[(i, j)] as f64;
 
             // Equation: x_j - x_i = ratio[i,j]
             // In normal equations form:
-            ata[(i, i)] += weight;
-            ata[(j, j)] += weight;
-            ata[(i, j)] -= weight;
-            ata[(j, i)] -= weight;
+            ata[(i_pos, i_pos)] += weight;
+            ata[(j_pos, j_pos)] += weight;
+            ata[(i_pos, j_pos)] -= weight;
+            ata[(j_pos, i_pos)] -= weight;
 
-            atb[i] -= weight * ratio;
-            atb[j] += weight * ratio;
+            atb[i_pos] -= weight * ratio;
+            atb[j_pos] += weight * ratio;
         }
     }
 
     // Fix gauge: set first active sample to 0
     // Replace first active sample's equation with x_ref = 0
-    let reference = active_indices[0];
-    for j in 0..n {
-        ata[(reference, j)] = 0.0;
+    let reference_pos = 0; // First position in active array
+    for j in 0..m {
+        ata[(reference_pos, j)] = 0.0;
     }
-    ata[(reference, reference)] = 1.0;
-    atb[reference] = 0.0;
+    ata[(reference_pos, reference_pos)] = 1.0;
+    atb[reference_pos] = 0.0;
 
     // Solve using LU decomposition (with fallback to QR)
     let solution = ata
@@ -309,30 +320,21 @@ fn solve_least_squares(ratios: &RatioMatrix) -> Option<Vec<f64>> {
         .solve(&atb)
         .or_else(|| ata.qr().solve(&atb))?;
 
-    // Center values (subtract mean of active samples)
-    let mut values: Vec<f64> = solution.as_slice().to_vec();
+    // Map solution back to full-sized vector (n samples)
+    // Active samples get solved values, inactive samples get NaN
+    let mut values = vec![f64::NAN; n];
+    for (pos, &global_idx) in active_indices.iter().enumerate() {
+        values[global_idx] = solution[pos];
+    }
     
+    // Center values (subtract mean of active samples)
     let mean = {
-        let mut sum = 0.0f64;
-        let mut count = 0usize;
-        for &idx in &active_indices {
-            sum += values[idx];
-            count += 1;
-        }
-        if count == 0 {
-            0.0
-        } else {
-            sum / count as f64
-        }
+        let sum: f64 = active_indices.iter().map(|&idx| values[idx]).sum();
+        sum / active_indices.len() as f64
     };
 
-    // Subtract mean and set inactive samples to NaN
-    for (idx, value) in values.iter_mut().enumerate() {
-        if ratios.active_samples[idx] {
-            *value -= mean;
-        } else {
-            *value = f64::NAN;
-        }
+    for &idx in &active_indices {
+        values[idx] -= mean;
     }
 
     Some(values)
@@ -605,5 +607,41 @@ mod tests {
         assert!(error_01 < 0.3);
         assert!(error_12 < 0.3);
         assert!(error_02 < 0.3);
+    }
+
+    #[test]
+    fn handles_protein_in_subset_of_samples() {
+        // Bug fix test: protein appears in samples 0,1 of a 4-sample experiment
+        // Should build system over active samples only, not singular matrix
+        let config = MaxLfqConfig {
+            min_peptides_per_ratio: 1,
+            ..Default::default()
+        };
+
+        // 4 samples total, but protein only in samples 0 and 1
+        let mut triplets = TriMat::new((2, 4));
+        triplets.add_triplet(0, 0, 10.0); // Peptide 1 in samples 0,1
+        triplets.add_triplet(0, 1, 11.0);
+        triplets.add_triplet(1, 0, 10.0); // Peptide 2 in samples 0,1
+        triplets.add_triplet(1, 1, 11.0);
+
+        let matrix = triplets.to_csr();
+        let ratio_matrix = build_ratio_matrix(&matrix, None, &config).expect("ratio");
+        let log_intensities = solve_least_squares(&ratio_matrix).expect("solution");
+
+        // Should succeed (not return None due to singular matrix)
+        assert_eq!(log_intensities.len(), 4);
+        
+        // Samples 0,1 should have values
+        assert!(!log_intensities[0].is_nan());
+        assert!(!log_intensities[1].is_nan());
+        
+        // Samples 2,3 should be NaN (inactive)
+        assert!(log_intensities[2].is_nan());
+        assert!(log_intensities[3].is_nan());
+        
+        // Ratio between active samples should be preserved
+        let diff = log_intensities[1] - log_intensities[0];
+        assert!((diff - 1.0).abs() < 1e-6);
     }
 }
