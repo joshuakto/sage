@@ -1,5 +1,3 @@
-#![cfg(all(test, feature = "protein-quant-prototype"))]
-
 use std::sync::Arc;
 
 use crate::{

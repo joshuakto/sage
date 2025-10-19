@@ -1088,5 +1088,5 @@ impl Query<'_> {
     }
 }
 
-#[cfg(all(test, feature = "protein-quant-prototype"))]
+#[cfg(test)]
 mod protein_tests;
