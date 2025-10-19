@@ -725,7 +725,7 @@ mod tests {
     use parquet::record::{Field, RowAccessor};
     use sage_core::database::PeptideIx;
     use sage_core::enzyme::Position;
-    use sage_core::lfq::{Peak, ProteinQuantResult};
+    use sage_core::lfq::{Peak, ProteinQuantResult, ProteinRollupResult};
     use sage_core::ml::matrix::Matrix;
     use sage_core::peptide::Peptide;
     use std::hash::BuildHasherDefault;
@@ -1011,11 +1011,18 @@ mod tests {
     #[test]
     fn serialize_lfq_proteins_round_trip() -> parquet::errors::Result<()> {
         let filenames = vec!["run_a".to_string(), "run_b".to_string()];
-        let proteins = vec![ProteinQuantResult {
-            protein_ids: vec!["P1".to_string(), "P2".to_string()],
-            lfq_intensities: vec![123.0, 456.0],
-            peptide_count: 3,
-            sample_coverage: vec![true, false],
+        let proteins = vec![ProteinRollupResult {
+            accessions: vec![Arc::<str>::from("P1"), Arc::<str>::from("P2")],
+            quant: ProteinQuantResult {
+                protein_ids: vec!["P1".to_string(), "P2".to_string()],
+                lfq_intensities: vec![123.0, 456.0],
+                peptide_count: 3,
+                sample_coverage: vec![true, false],
+            },
+            q_value: 0.123,
+            total_peptide_count: 5,
+            passing_peptide_count: 4,
+            run_coverage: vec![2, 0],
         }];
 
         let parquet_buffer = serialize_lfq_proteins(&proteins, &filenames)?;
@@ -1024,16 +1031,25 @@ mod tests {
 
         let first = rows.next().expect("protein row")?;
         assert_eq!(first.get_string(0)?, "P1;P2");
-        assert_eq!(first.get_int(1)?, 3);
-        assert_eq!(first.get_string(2)?, "run_a");
-        assert!((first.get_float(3)? - 123.0).abs() < f32::EPSILON);
-        assert!(first.get_bool(4)?);
+        assert!((first.get_float(1)? - 0.123).abs() < f32::EPSILON);
+        assert_eq!(first.get_int(2)?, 5);
+        assert_eq!(first.get_int(3)?, 4);
+        assert_eq!(first.get_int(4)?, 3);
+        assert_eq!(first.get_string(5)?, "run_a");
+        assert!((first.get_float(6)? - 123.0).abs() < f32::EPSILON);
+        assert!(first.get_bool(7)?);
+        assert_eq!(first.get_int(8)?, 2);
 
         let second = rows.next().expect("second protein row")?;
         assert_eq!(second.get_string(0)?, "P1;P2");
-        assert_eq!(second.get_string(2)?, "run_b");
-        assert!((second.get_float(3)? - 456.0).abs() < f32::EPSILON);
-        assert!(!second.get_bool(4)?);
+        assert!((second.get_float(1)? - 0.123).abs() < f32::EPSILON);
+        assert_eq!(second.get_int(2)?, 5);
+        assert_eq!(second.get_int(3)?, 4);
+        assert_eq!(second.get_int(4)?, 3);
+        assert_eq!(second.get_string(5)?, "run_b");
+        assert!((second.get_float(6)? - 456.0).abs() < f32::EPSILON);
+        assert!(!second.get_bool(7)?);
+        assert_eq!(second.get_int(8)?, 0);
 
         assert!(rows.next().is_none());
 
