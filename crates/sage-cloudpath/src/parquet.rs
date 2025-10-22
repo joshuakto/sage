@@ -1011,35 +1011,41 @@ mod tests {
     #[test]
     fn serialize_lfq_proteins_round_trip() -> parquet::errors::Result<()> {
         let filenames = vec!["run_a".to_string(), "run_b".to_string()];
+        
+        // Build ProteinRollupResult with new schema fields
         let proteins = vec![ProteinRollupResult {
             accessions: vec![Arc::<str>::from("P1"), Arc::<str>::from("P2")],
             quant: ProteinQuantResult {
                 protein_ids: vec!["P1".to_string(), "P2".to_string()],
                 lfq_intensities: vec![123.0, 456.0],
                 peptide_count: 3,
-                sample_coverage: vec![true, false],
+                sample_coverage: vec![true, false],  // run_b not covered by MaxLFQ
             },
             q_value: 0.123,
             total_peptide_count: 5,
             passing_peptide_count: 4,
-            run_coverage: vec![2, 0],
+            run_coverage: vec![2, 0],  // run_b has 0 contributors (not covered)
         }];
 
         let parquet_buffer = serialize_lfq_proteins(&proteins, &filenames)?;
         let reader = SerializedFileReader::new(Bytes::from(parquet_buffer))?;
         let mut rows = reader.get_row_iter(None)?;
 
+        // Verify first row (run_a)
+        // Schema: proteins, q_value, total_peptides, passing_peptides, lfq_peptide_count,
+        //         filename, intensity, covered, contributors
         let first = rows.next().expect("protein row")?;
-        assert_eq!(first.get_string(0)?, "P1;P2");
-        assert!((first.get_float(1)? - 0.123).abs() < f32::EPSILON);
-        assert_eq!(first.get_int(2)?, 5);
-        assert_eq!(first.get_int(3)?, 4);
-        assert_eq!(first.get_int(4)?, 3);
-        assert_eq!(first.get_string(5)?, "run_a");
-        assert!((first.get_float(6)? - 123.0).abs() < f32::EPSILON);
-        assert!(first.get_bool(7)?);
-        assert_eq!(first.get_int(8)?, 2);
+        assert_eq!(first.get_string(0)?, "P1;P2");                           // proteins
+        assert!((first.get_float(1)? - 0.123).abs() < f32::EPSILON);         // q_value
+        assert_eq!(first.get_int(2)?, 5);                                    // total_peptides
+        assert_eq!(first.get_int(3)?, 4);                                    // passing_peptides
+        assert_eq!(first.get_int(4)?, 3);                                    // lfq_peptide_count
+        assert_eq!(first.get_string(5)?, "run_a");                           // filename
+        assert!((first.get_float(6)? - 123.0).abs() < f32::EPSILON);         // intensity
+        assert!(first.get_bool(7)?);                                         // covered
+        assert_eq!(first.get_int(8)?, 2);                                    // contributors
 
+        // Verify second row (run_b)
         let second = rows.next().expect("second protein row")?;
         assert_eq!(second.get_string(0)?, "P1;P2");
         assert!((second.get_float(1)? - 0.123).abs() < f32::EPSILON);
@@ -1048,8 +1054,8 @@ mod tests {
         assert_eq!(second.get_int(4)?, 3);
         assert_eq!(second.get_string(5)?, "run_b");
         assert!((second.get_float(6)? - 456.0).abs() < f32::EPSILON);
-        assert!(!second.get_bool(7)?);
-        assert_eq!(second.get_int(8)?, 0);
+        assert!(!second.get_bool(7)?);                                       // not covered
+        assert_eq!(second.get_int(8)?, 0);                                   // contributors (0 because not covered)
 
         assert!(rows.next().is_none());
 

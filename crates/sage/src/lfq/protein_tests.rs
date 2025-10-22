@@ -571,6 +571,84 @@ fn digest_protein_map(
 }
 
 #[test]
+fn multiple_charge_states_are_quantified_by_maxlfq() {
+    let run_count = 2;
+    let db = fake_database(vec![
+        fake_peptide("PEPA", &["P12345"], false),
+        fake_peptide("PEPB", &["P12345"], false),
+    ]);
+    
+    // Create traces with multiple charge states per peptide
+    let traces = vec![
+        // PEPA with charge 2
+        fake_trace_with_precursor(
+            PrecursorId::Charged((PeptideIx(0), 2)),
+            0,
+            false,
+            0.001,
+            &[100.0, 50.0],
+        ),
+        // PEPA with charge 3 (additional evidence for same peptide)
+        fake_trace_with_precursor(
+            PrecursorId::Charged((PeptideIx(0), 3)),
+            0,
+            false,
+            0.002,
+            &[80.0, 40.0],
+        ),
+        // PEPB with charge 2
+        fake_trace_with_precursor(
+            PrecursorId::Charged((PeptideIx(1), 2)),
+            1,
+            false,
+            0.003,
+            &[200.0, 100.0],
+        ),
+        // PEPB with charge 3
+        fake_trace_with_precursor(
+            PrecursorId::Charged((PeptideIx(1), 3)),
+            1,
+            false,
+            0.004,
+            &[150.0, 75.0],
+        ),
+    ];
+    
+    let groups = ProteinQuantTrace::group_by_accession(&db, &traces, run_count, 0.01);
+    
+    // Verify protein rollup aggregated all charge states
+    let mut accession = db.proteins(PeptideIx(0));
+    accession.sort_unstable();
+    let protein_trace = groups.get(&accession).expect("protein missing");
+    assert_eq!(protein_trace.intensities, vec![530.0, 265.0]); // Sum of all traces
+    assert_eq!(protein_trace.total_peptide_count, 4); // 4 traces total
+    assert_eq!(protein_trace.passing_peptide_count, 2); // 2 unique peptides
+    
+    // Now verify MaxLFQ receives all 4 traces (not just 2)
+    let results = quantify_protein_groups(
+        &traces,
+        &groups,
+        MaxLfqConfig {
+            min_peptides_per_ratio: 2,
+            min_samples_for_protein: 1,
+            use_global_normalization: false,
+            reference_sample: None,
+        },
+    )
+    .expect("quantification should succeed");
+    
+    assert_eq!(results.len(), 1);
+    let protein = &results[0];
+    assert_eq!(protein.quant.protein_ids, vec!["P12345".to_string()]);
+    
+    // The peptide_count should be 4 (all charge state traces), not 2
+    // This verifies that all traces made it through to MaxLFQ
+    assert_eq!(protein.quant.peptide_count, 4);
+    assert!(protein.quant.sample_coverage[0]);
+    assert!(protein.quant.sample_coverage[1]);
+}
+
+#[test]
 fn protein_grouping_is_deterministic_across_input_orders() {
     let run_count = 4;
     let db = fake_database(vec![
