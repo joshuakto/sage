@@ -13,4 +13,7 @@ pub enum MaxLfqError {
 
     #[error("Invalid reference sample index: {0}")]
     InvalidReferenceSample(usize),
+
+    #[error("Invalid parameter: {0}")]
+    InvalidParameter(String),
 }

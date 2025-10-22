@@ -328,6 +328,14 @@ fn build_solver_groups(
         .collect()
 }
 
+/// Check if a peptide quantification trace passes the FDR threshold for protein quantification.
+///
+/// Traces are excluded if they are decoys or if their precursor q-value exceeds the threshold.
+#[inline]
+fn passes_fdr_filter(trace: &PeptideQuantTrace, max_precursor_q: f32) -> bool {
+    !trace.decoy && trace.peak.q_value <= max_precursor_q
+}
+
 /// Convert protein-level quantification traces into MaxLFQ protein roll-up results.
 ///
 /// The helper prepares the deterministic `(Vec<String>, Vec<usize>)` tuples required
@@ -349,14 +357,60 @@ pub fn quantify_protein_groups(
     max_precursor_q: f32,
     config: MaxLfqConfig,
 ) -> Result<Vec<ProteinRollupResult>, MaxLfqError> {
+    // Validate q-value threshold is in valid range
+    if !(0.0..=1.0).contains(&max_precursor_q) {
+        return Err(MaxLfqError::InvalidParameter(format!(
+            "max_precursor_q must be in [0.0, 1.0], got {}",
+            max_precursor_q
+        )));
+    }
+
     let mut index_lookup: FnvHashMap<PeptideIx, Vec<usize>> = FnvHashMap::default();
 
     for (row, trace) in traces.iter().enumerate() {
-        if trace.decoy || trace.peak.q_value > max_precursor_q {
+        if !passes_fdr_filter(trace, max_precursor_q) {
             continue;
         }
 
         index_lookup.entry(trace.peptide).or_default().push(row);
+    }
+
+    // Debug assertion: verify no high-q traces leaked through
+    #[cfg(debug_assertions)]
+    {
+        for rows in index_lookup.values() {
+            for &row in rows {
+                debug_assert!(
+                    passes_fdr_filter(&traces[row], max_precursor_q),
+                    "High-q trace (q={}) leaked into index_lookup at row {}",
+                    traces[row].peak.q_value,
+                    row
+                );
+            }
+        }
+    }
+
+    // Log how many traces were filtered by q-value threshold
+    let total_target_traces = traces.iter().filter(|t| !t.decoy).count();
+    let passing_traces: usize = index_lookup.values().map(|v| v.len()).sum();
+    let filtered_traces = total_target_traces - passing_traces;
+
+    if filtered_traces > 0 {
+        log::info!(
+            "filtered {} precursor traces (q > {:.3}) before MaxLFQ quantification",
+            filtered_traces,
+            max_precursor_q
+        );
+    }
+
+    if index_lookup.is_empty() {
+        log::warn!(
+            "all {} target traces were filtered by q-value threshold ({:.3}); \
+             consider relaxing max_precursor_q or reviewing upstream FDR control",
+            total_target_traces,
+            max_precursor_q
+        );
+        return Ok(Vec::new());
     }
 
     let total_proteins = proteins.len();

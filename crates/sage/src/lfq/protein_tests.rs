@@ -767,6 +767,118 @@ fn high_q_charge_states_are_excluded_from_maxlfq() {
 }
 
 #[test]
+fn mixed_quality_charge_states_honors_fdr_at_quantification() {
+    // Integration test verifying that when a peptide has multiple charge states with
+    // different q-values, only those meeting the FDR threshold contribute to protein
+    // quantification. This ensures charge states cannot "piggyback" on high-confidence
+    // siblings to bypass FDR control.
+    //
+    // Test scenario:
+    // - Protein with 2 peptides (PEPA, PEPB)
+    // - PEPA has 2 charge states: +2 (q=0.003, passing) and +3 (q=0.08, failing)
+    // - PEPB has 1 charge state: +2 (q=0.005, passing)
+    // - Threshold: max_precursor_q = 0.01
+    //
+    // Expected behavior:
+    // 1. group_by_accession counts all 3 traces as total_peptide_count
+    // 2. Only 2 unique peptides (PEPA, PEPB) pass threshold → passing_peptide_count = 2
+    // 3. MaxLFQ receives exactly 2 traces (PEPA+2, PEPB+2), NOT 3
+    //
+    // This test validates the complete pipeline from protein grouping through quantification.
+
+    let run_count = 2;
+    let max_precursor_q = 0.01;
+    let db = fake_database(vec![
+        fake_peptide("PEPA", &["P12345"], false),
+        fake_peptide("PEPB", &["P12345"], false),
+    ]);
+
+    let traces = vec![
+        // PEPA charge +2: PASSING
+        fake_trace_with_precursor(
+            PrecursorId::Charged((PeptideIx(0), 2)),
+            0,
+            false,
+            0.003,
+            &[150.0, 100.0],
+        ),
+        // PEPA charge +3: FAILING (should be excluded from MaxLFQ)
+        fake_trace_with_precursor(
+            PrecursorId::Charged((PeptideIx(0), 3)),
+            0,
+            false,
+            0.08,
+            &[500.0, 400.0],
+        ),
+        // PEPB charge +2: PASSING
+        fake_trace_with_precursor(
+            PrecursorId::Charged((PeptideIx(1), 2)),
+            1,
+            false,
+            0.005,
+            &[200.0, 150.0],
+        ),
+    ];
+
+    // Step 1: Protein grouping should see all traces
+    let groups = ProteinQuantTrace::group_by_accession(&db, &traces, run_count, max_precursor_q);
+
+    assert_eq!(groups.len(), 1, "Should have exactly 1 protein group");
+    let protein_trace = groups.values().next().expect("protein group exists");
+
+    assert_eq!(
+        protein_trace.total_peptide_count, 3,
+        "Should count all 3 traces in total"
+    );
+    assert_eq!(
+        protein_trace.passing_peptide_count, 2,
+        "Only 2 unique peptides pass threshold (PEPA and PEPB)"
+    );
+    assert_eq!(
+        protein_trace.peptide_indices.len(),
+        2,
+        "Should track 2 unique peptides"
+    );
+
+    // Step 2: Quantification should exclude the high-q trace
+    let results = quantify_protein_groups(
+        &traces,
+        &groups,
+        max_precursor_q,
+        MaxLfqConfig {
+            min_peptides_per_ratio: 2,
+            min_samples_for_protein: 1,
+            use_global_normalization: false,
+            reference_sample: None,
+        },
+    )
+    .expect("quantification should succeed");
+
+    assert_eq!(results.len(), 1, "Should quantify 1 protein");
+    let protein = &results[0];
+
+    // Critical assertion: only 2 traces should reach MaxLFQ
+    assert_eq!(
+        protein.quant.peptide_count, 2,
+        "MaxLFQ should receive exactly 2 traces (PEPA+2 and PEPB+2); \
+         the high-q PEPA+3 trace must be excluded"
+    );
+
+    // Metadata should reflect the full picture
+    assert_eq!(protein.total_peptide_count, 3, "Metadata preserves total count");
+    assert_eq!(
+        protein.passing_peptide_count, 2,
+        "Metadata shows 2 peptides passed"
+    );
+
+    // Verify sample coverage
+    assert!(
+        protein.quant.sample_coverage.iter().all(|covered| *covered),
+        "Both samples should have coverage"
+    );
+}
+
+#[test]
 fn protein_grouping_is_deterministic_across_input_orders() {
     let run_count = 4;
     let db = fake_database(vec![
