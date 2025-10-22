@@ -283,7 +283,7 @@ impl ProteinQuantTrace {
 }
 
 fn build_solver_groups(
-    index_lookup: &FnvHashMap<PeptideIx, usize>,
+    index_lookup: &FnvHashMap<PeptideIx, Vec<usize>>,
     proteins: &BTreeMap<Vec<Arc<str>>, ProteinQuantTrace>,
     config: &MaxLfqConfig,
 ) -> Vec<(Vec<String>, Vec<usize>)> {
@@ -293,30 +293,34 @@ fn build_solver_groups(
                 return None;
             }
 
-            let mut peptide_indices: Vec<usize> = trace
-                .peptide_indices
-                .iter()
-                .filter_map(|ix| index_lookup.get(ix).copied())
-                .collect();
+            let mut peptide_rows: Vec<usize> = Vec::new();
+            let mut observed_peptides = 0usize;
 
-            if peptide_indices.is_empty() {
+            for ix in &trace.peptide_indices {
+                if let Some(rows) = index_lookup.get(ix) {
+                    observed_peptides += 1;
+                    peptide_rows.extend(rows.iter().copied());
+                }
+            }
+
+            if peptide_rows.is_empty() {
                 return None;
             }
 
             // Filter proteins that don't meet minimum peptide threshold
             // This prevents InsufficientPeptides errors in the MaxLFQ solver
-            if peptide_indices.len() < config.min_peptides_per_ratio {
+            if observed_peptides < config.min_peptides_per_ratio {
                 return None;
             }
 
-            peptide_indices.sort_unstable();
+            peptide_rows.sort_unstable();
 
             let accession_strings = accessions
                 .iter()
                 .map(|acc| acc.as_ref().to_string())
                 .collect::<Vec<_>>();
 
-            Some((accession_strings, peptide_indices))
+            Some((accession_strings, peptide_rows))
         })
         .collect()
 }
@@ -339,14 +343,14 @@ pub fn quantify_protein_groups(
     proteins: &BTreeMap<Vec<Arc<str>>, ProteinQuantTrace>,
     config: MaxLfqConfig,
 ) -> Result<Vec<ProteinRollupResult>, MaxLfqError> {
-    let mut index_lookup: FnvHashMap<PeptideIx, usize> = FnvHashMap::default();
+    let mut index_lookup: FnvHashMap<PeptideIx, Vec<usize>> = FnvHashMap::default();
 
     for (row, trace) in traces.iter().enumerate() {
         if trace.decoy {
             continue;
         }
 
-        index_lookup.entry(trace.peptide).or_insert(row);
+        index_lookup.entry(trace.peptide).or_default().push(row);
     }
 
     let total_proteins = proteins.len();
