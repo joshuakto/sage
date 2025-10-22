@@ -88,6 +88,50 @@ fn single_peptide_proteins_are_filtered_not_fatal() {
     assert_eq!(protein.quant.peptide_count, 2);
 }
 
+#[test]
+fn peptide_counts_distinguish_total_vs_passing() {
+    // Regression test for bug where pre-filtering traces caused
+    // total_peptide_count to equal passing_peptide_count
+    let run_count = 2;
+    let db = fake_database(vec![
+        fake_peptide("PEPA", &["P12345"], false),
+        fake_peptide("PEPB", &["P12345"], false),
+        fake_peptide("PEPC", &["P12345"], false),
+    ]);
+
+    let max_precursor_q = 0.01;
+    let traces = vec![
+        fake_trace(0, false, 0.001, &[100.0, 50.0]),   // Passing (q=0.001 <= 0.01)
+        fake_trace(1, false, 0.005, &[200.0, 150.0]),  // Passing (q=0.005 <= 0.01)
+        fake_trace(2, false, 0.15, &[300.0, 250.0]),   // Failing (q=0.15 > 0.01)
+    ];
+
+    // Pass ALL traces (including high q-value) to group_by_accession
+    // This is how the runner SHOULD work after the fix
+    let groups = ProteinQuantTrace::group_by_accession(&db, &traces, run_count, max_precursor_q);
+
+    assert_eq!(groups.len(), 1, "Should have 1 protein group");
+    let protein = groups.values().next().expect("protein group");
+
+    // Critical assertions: these will FAIL with the buggy pre-filtering
+    assert_eq!(
+        protein.total_peptide_count, 3,
+        "Should count ALL peptides (including those above q-value threshold)"
+    );
+    assert_eq!(
+        protein.passing_peptide_count, 2,
+        "Should count only peptides passing q-value threshold"
+    );
+    assert!(
+        protein.total_peptide_count > protein.passing_peptide_count,
+        "Bug check: total MUST exceed passing when some peptides have high q-values. \
+         If this fails, pre-filtering is removing high q-value traces before aggregation."
+    );
+
+    // Verify the passing peptides are correctly identified
+    assert_eq!(protein.peptide_indices.len(), 2, "Should track 2 unique passing peptides");
+}
+
 impl IndexedDatabaseProteinsExt for IndexedDatabase {
     fn proteins(&self, ix: PeptideIx) -> Vec<Arc<str>> {
         self.peptides[ix.0 as usize].proteins.clone()

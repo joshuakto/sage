@@ -362,7 +362,7 @@ pub fn quantify_protein_groups(
 
     if filtered_count > 0 {
         log::info!(
-            "filtered {} protein groups (< {} peptides per protein)",
+            "filtered {} protein groups (decoys or < {} peptides)",
             filtered_count,
             config.min_peptides_per_ratio
         );

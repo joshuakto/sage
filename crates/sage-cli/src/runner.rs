@@ -582,9 +582,12 @@ impl Runner {
 
                 if self.parameters.quant.lfq_proteins.enabled {
                     let max_precursor_q = self.parameters.quant.lfq_settings.max_precursor_q;
+                    // Pass ALL target traces (including high q-value) to group_by_accession
+                    // so it can correctly compute total_peptide_count vs passing_peptide_count.
+                    // The q-value filtering happens inside group_by_accession via max_precursor_q.
                     let mut peptide_traces: Vec<PeptideQuantTrace> = areas
                         .values()
-                        .filter(|trace| !trace.decoy && trace.peak.q_value <= max_precursor_q)
+                        .filter(|trace| !trace.decoy)
                         .cloned()
                         .collect();
 
