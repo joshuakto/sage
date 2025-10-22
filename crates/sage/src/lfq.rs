@@ -16,7 +16,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
-pub use sage_lfq::{MaxLfqConfig, MaxLfqError, ProteinQuantResult};
+pub use sage_lfq::{
+    MaxLfqConfig, MaxLfqError, ProteinQuantResult, QuantificationResult, SkipReason,
+    SkippedProtein,
+};
 
 /// Minimum normalized spectral angle required to integrate a peak
 // const MIN_SPECTRAL_ANGLE: f64 = 0.70;
@@ -308,7 +311,7 @@ fn build_solver_groups(
             }
 
             // Filter proteins that don't meet minimum peptide threshold
-            // This prevents InsufficientPeptides errors in the MaxLFQ solver
+            // These will be silently skipped by the MaxLFQ solver if they reach it
             if observed_peptides < config.min_peptides_per_ratio {
                 return None;
             }
@@ -373,7 +376,36 @@ pub fn quantify_protein_groups(
     log::info!("quantifying {} protein groups with MaxLFQ", groups.len());
 
     // Run MaxLFQ quantification
-    let quant_results = sage_lfq::quantify_proteins(traces, &groups, config)?;
+    let result = sage_lfq::quantify_proteins(traces, &groups, config)?;
+
+    // Report skipped proteins with explicit reasons
+    if !result.skipped.is_empty() {
+        let skipped_examples: Vec<String> = result
+            .skipped
+            .iter()
+            .take(5)
+            .map(|s| format!("{}({})", s.protein_ids.join(";"), match s.reason {
+                sage_lfq::SkipReason::DisconnectedGraph => "disconnected",
+                sage_lfq::SkipReason::InsufficientPeptides => "insufficient peptides",
+            }))
+            .collect();
+
+        if result.skipped.len() <= 5 {
+            log::warn!(
+                "skipped {} protein groups: {}",
+                result.skipped.len(),
+                skipped_examples.join(", ")
+            );
+        } else {
+            log::warn!(
+                "skipped {} protein groups; examples: {}",
+                result.skipped.len(),
+                skipped_examples.join(", ")
+            );
+        }
+    }
+
+    let quant_results = result.quantified;
 
     // Zip quantification results with protein metadata
     // Match by protein IDs to preserve all metadata
