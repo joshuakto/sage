@@ -337,19 +337,22 @@ fn build_solver_groups(
 /// downstream solver only evaluates target proteins with usable evidence.
 ///
 /// Proteins with fewer peptides than `config.min_peptides_per_ratio` are filtered
-/// out before quantification to prevent errors in the MaxLFQ solver.
+/// out before quantification to prevent errors in the MaxLFQ solver. Only traces
+/// whose precursor q-value is at or below `max_precursor_q` contribute to the
+/// MaxLFQ system so high-q evidence cannot bypass FDR filtering during roll-up.
 ///
 /// Returns [`ProteinRollupResult`] which combines MaxLFQ intensities with protein
 /// metadata (q-value, peptide counts, run coverage) for comprehensive quality control.
 pub fn quantify_protein_groups(
     traces: &[PeptideQuantTrace],
     proteins: &BTreeMap<Vec<Arc<str>>, ProteinQuantTrace>,
+    max_precursor_q: f32,
     config: MaxLfqConfig,
 ) -> Result<Vec<ProteinRollupResult>, MaxLfqError> {
     let mut index_lookup: FnvHashMap<PeptideIx, Vec<usize>> = FnvHashMap::default();
 
     for (row, trace) in traces.iter().enumerate() {
-        if trace.decoy {
+        if trace.decoy || trace.peak.q_value > max_precursor_q {
             continue;
         }
 

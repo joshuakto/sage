@@ -614,8 +614,13 @@ impl Runner {
                         };
 
                         protein_rollup = Some(
-                            quantify_protein_groups(&peptide_traces, &protein_groups, config)
-                                .map_err(anyhow::Error::from)?,
+                            quantify_protein_groups(
+                                &peptide_traces,
+                                &protein_groups,
+                                max_precursor_q,
+                                config,
+                            )
+                            .map_err(anyhow::Error::from)?,
                         );
                     } else {
                         log::info!("no peptide traces passed protein LFQ filters");

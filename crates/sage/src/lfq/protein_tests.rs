@@ -28,11 +28,13 @@ fn quantify_protein_groups_converts_peptides() {
         fake_trace(1, false, 0.007, &[10.0, 0.0]),
     ];
 
-    let groups = ProteinQuantTrace::group_by_accession(&db, &traces, run_count, 0.01);
+    let max_precursor_q = 0.01;
+    let groups = ProteinQuantTrace::group_by_accession(&db, &traces, run_count, max_precursor_q);
 
     let results = quantify_protein_groups(
         &traces,
         &groups,
+        max_precursor_q,
         MaxLfqConfig {
             min_peptides_per_ratio: 1,
             min_samples_for_protein: 1,
@@ -65,13 +67,15 @@ fn single_peptide_proteins_are_filtered_not_fatal() {
         fake_trace(2, false, 0.007, &[300.0, 250.0]),
     ];
 
-    let groups = ProteinQuantTrace::group_by_accession(&db, &traces, run_count, 0.01);
+    let max_precursor_q = 0.01;
+    let groups = ProteinQuantTrace::group_by_accession(&db, &traces, run_count, max_precursor_q);
     assert_eq!(groups.len(), 2); // Both proteins initially grouped
 
     // With min_peptides=2, single-peptide protein should be filtered, not cause error
     let results = quantify_protein_groups(
         &traces,
         &groups,
+        max_precursor_q,
         MaxLfqConfig {
             min_peptides_per_ratio: 2,
             min_samples_for_protein: 1,
@@ -657,9 +661,10 @@ fn multiple_charge_states_are_quantified_by_maxlfq() {
             &[150.0, 75.0],
         ),
     ];
-    
-    let groups = ProteinQuantTrace::group_by_accession(&db, &traces, run_count, 0.01);
-    
+
+    let max_precursor_q = 0.01;
+    let groups = ProteinQuantTrace::group_by_accession(&db, &traces, run_count, max_precursor_q);
+
     // Verify protein rollup aggregated all charge states
     let mut accession = db.proteins(PeptideIx(0));
     accession.sort_unstable();
@@ -667,11 +672,12 @@ fn multiple_charge_states_are_quantified_by_maxlfq() {
     assert_eq!(protein_trace.intensities, vec![530.0, 265.0]); // Sum of all traces
     assert_eq!(protein_trace.total_peptide_count, 4); // 4 traces total
     assert_eq!(protein_trace.passing_peptide_count, 2); // 2 unique peptides
-    
+
     // Now verify MaxLFQ receives all 4 traces (not just 2)
     let results = quantify_protein_groups(
         &traces,
         &groups,
+        max_precursor_q,
         MaxLfqConfig {
             min_peptides_per_ratio: 2,
             min_samples_for_protein: 1,
@@ -690,6 +696,74 @@ fn multiple_charge_states_are_quantified_by_maxlfq() {
     assert_eq!(protein.quant.peptide_count, 4);
     assert!(protein.quant.sample_coverage[0]);
     assert!(protein.quant.sample_coverage[1]);
+}
+
+#[test]
+fn high_q_charge_states_are_excluded_from_maxlfq() {
+    // Regression test for bug where high-q precursor traces could bypass FDR filtering
+    // when a peptide had at least one passing charge state.
+    //
+    // Scenario: Peptide A has two charge states:
+    //   - Charge +2: q=0.002 (PASSING with threshold 0.01)
+    //   - Charge +3: q=0.2   (FAILING with threshold 0.01)
+    //
+    // Expected: Only the passing trace should reach MaxLFQ (peptide_count = 1)
+    // Bug behavior: Both traces reach MaxLFQ (peptide_count = 2)
+
+    let run_count = 2;
+    let max_precursor_q = 0.01;
+    let db = fake_database(vec![fake_peptide("PEPA", &["P12345"], false)]);
+
+    let traces = vec![
+        // Passing charge state
+        fake_trace_with_precursor(
+            PrecursorId::Charged((PeptideIx(0), 2)),
+            0,
+            false,
+            0.002,
+            &[100.0, 50.0],
+        ),
+        // Failing charge state for the same peptide
+        fake_trace_with_precursor(
+            PrecursorId::Charged((PeptideIx(0), 3)),
+            0,
+            false,
+            0.2,
+            &[400.0, 200.0],
+        ),
+    ];
+
+    let groups = ProteinQuantTrace::group_by_accession(&db, &traces, run_count, max_precursor_q);
+
+    let results = quantify_protein_groups(
+        &traces,
+        &groups,
+        max_precursor_q,
+        MaxLfqConfig {
+            min_peptides_per_ratio: 1,
+            min_samples_for_protein: 1,
+            use_global_normalization: false,
+            reference_sample: None,
+        },
+    )
+    .expect("protein quantification should succeed");
+
+    assert_eq!(results.len(), 1);
+    let protein = &results[0];
+
+    // Critical assertion: verify high-q trace was excluded
+    assert_eq!(
+        protein.quant.peptide_count, 1,
+        "High-q traces must be excluded from MaxLFQ; only the passing trace should contribute"
+    );
+
+    // Additional validation
+    assert_eq!(protein.total_peptide_count, 2, "Should count both traces");
+    assert_eq!(
+        protein.passing_peptide_count, 1,
+        "Only one peptide passes q-value threshold"
+    );
+    assert!(protein.quant.sample_coverage.iter().all(|covered| *covered));
 }
 
 #[test]
