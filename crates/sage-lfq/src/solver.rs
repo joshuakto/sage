@@ -131,7 +131,7 @@ fn build_ratio_matrix(
         if !values.is_empty() {
             values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let median = compute_median(&values);
-            
+
             ratios[(i, j)] = median;
             counts[(i, j)] = values.len();
             has_ratio = true;
@@ -326,7 +326,7 @@ fn solve_least_squares(ratios: &RatioMatrix) -> Option<Vec<f64>> {
     for (pos, &global_idx) in active_indices.iter().enumerate() {
         values[global_idx] = solution[pos];
     }
-    
+
     // Center values (subtract mean of active samples)
     let mean = {
         let sum: f64 = active_indices.iter().map(|&idx| values[idx]).sum();
@@ -427,12 +427,12 @@ mod tests {
             "expected fold-change of 1, got {diff}"
         );
     }
-    
+
     #[test]
     fn median_robust_to_outliers() {
         // Test that median aggregation is robust to outlier peptides
         let mut triplets = TriMat::new((5, 2)); // 5 peptides, 2 samples
-        
+
         // 4 peptides show 1.0 log2 fold-change
         triplets.add_triplet(0, 0, 10.0);
         triplets.add_triplet(0, 1, 11.0);
@@ -442,11 +442,11 @@ mod tests {
         triplets.add_triplet(2, 1, 11.0);
         triplets.add_triplet(3, 0, 10.0);
         triplets.add_triplet(3, 1, 11.0);
-        
+
         // 1 outlier peptide shows 5.0 log2 fold-change (contamination/mismatch)
         triplets.add_triplet(4, 0, 10.0);
         triplets.add_triplet(4, 1, 15.0);
-        
+
         let matrix = triplets.to_csr();
         let config = MaxLfqConfig::default();
         let ratio_matrix = build_ratio_matrix(&matrix, None, &config).expect("ratio matrix");
@@ -458,7 +458,7 @@ mod tests {
             "median should be ~1.0, got {median_ratio}"
         );
     }
-    
+
     #[test]
     fn single_sample_protein_quantification() {
         // Test that proteins quantified in only one sample are handled
@@ -482,7 +482,7 @@ mod tests {
         let profile = result.unwrap();
         assert_eq!(profile.n_quantified_samples, 1);
     }
-    
+
     #[test]
     fn disconnected_samples_rejected() {
         // Test that proteins with no shared peptides between samples are rejected
@@ -493,24 +493,24 @@ mod tests {
         };
 
         let mut triplets = TriMat::new((4, 4)); // 4 peptides, 4 samples
-        // Peptides 0,1 only in samples 0,1
+                                                // Peptides 0,1 only in samples 0,1
         triplets.add_triplet(0, 0, 10.0);
         triplets.add_triplet(0, 1, 11.0);
         triplets.add_triplet(1, 0, 10.0);
         triplets.add_triplet(1, 1, 11.0);
-        
+
         // Peptides 2,3 only in samples 2,3 (disconnected!)
         triplets.add_triplet(2, 2, 10.0);
         triplets.add_triplet(2, 3, 11.0);
         triplets.add_triplet(3, 2, 10.0);
         triplets.add_triplet(3, 3, 11.0);
-        
+
         let matrix = triplets.to_csr();
         let result = ProteinSolver::quantify(&matrix, None, &config);
 
         assert!(result.is_none(), "disconnected samples should be rejected");
     }
-    
+
     #[test]
     fn median_calculation_correctness() {
         // Test median calculation for different scenarios
@@ -534,8 +534,9 @@ mod tests {
         };
         let normalization = [0.0, 1.0]; // Sample 1 has 1.0 offset to subtract
 
-        let ratio_matrix = build_ratio_matrix(&matrix, Some(&normalization), &config).expect("ratio");
-        
+        let ratio_matrix =
+            build_ratio_matrix(&matrix, Some(&normalization), &config).expect("ratio");
+
         // After subtracting offset: sample 0 = 10.0, sample 1 = 12.0 - 1.0 = 11.0
         // Ratio should be 1.0 (not 2.0)
         assert!((ratio_matrix.ratios[(0, 1)] - 1.0).abs() < 1e-6);
@@ -559,7 +560,10 @@ mod tests {
 
         // With only 1 peptide per pair and threshold=2, all edges invalid
         // Should return None (cannot quantify with no valid edges)
-        assert!(result.is_none(), "Should reject protein with insufficient peptides per ratio");
+        assert!(
+            result.is_none(),
+            "Should reject protein with insufficient peptides per ratio"
+        );
     }
 
     #[test]
@@ -570,7 +574,7 @@ mod tests {
             min_peptides_per_ratio: 1, // Allow edges with 1+ peptides
             ..Default::default()
         };
-        
+
         let mut triplets = TriMat::new((6, 3));
         // 2 peptides between samples 0,1 with diff ~1.0
         triplets.add_triplet(0, 0, 10.0);
@@ -602,7 +606,7 @@ mod tests {
         let error_01 = (diff_01 - 1.0).abs();
         let error_12 = (diff_12 - 1.0).abs();
         let error_02 = (diff_02 - 1.5).abs();
-        
+
         // Total squared error should be minimized
         assert!(error_01 < 0.3);
         assert!(error_12 < 0.3);
@@ -631,15 +635,15 @@ mod tests {
 
         // Should succeed (not return None due to singular matrix)
         assert_eq!(log_intensities.len(), 4);
-        
+
         // Samples 0,1 should have values
         assert!(!log_intensities[0].is_nan());
         assert!(!log_intensities[1].is_nan());
-        
+
         // Samples 2,3 should be NaN (inactive)
         assert!(log_intensities[2].is_nan());
         assert!(log_intensities[3].is_nan());
-        
+
         // Ratio between active samples should be preserved
         let diff = log_intensities[1] - log_intensities[0];
         assert!((diff - 1.0).abs() < 1e-6);

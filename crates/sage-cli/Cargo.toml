@@ -20,6 +20,7 @@ path = "src/main.rs"
 
 [dependencies]
 sage-core = { path = "../sage" }
+sage-lfq = { path = "../sage-lfq" }
 sage-cloudpath = { path = "../sage-cloudpath", features = ["parquet"] }
 
 anyhow = "1.0"

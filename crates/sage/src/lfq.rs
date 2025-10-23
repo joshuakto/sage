@@ -1,8 +1,34 @@
-//! Label-free quantification routines.
+//! Label-free quantification (LFQ) for proteomics data using the MaxLFQ algorithm.
 //!
 //! Protein-level aggregation relies on deterministic data structures so repeated analyses
 //! produce bytewise-identical outputs that downstream reporting and regulatory pipelines can
 //! reproduce.
+//!
+//! # Terminology Note: Proteomics vs. Genomics
+//!
+//! This module uses **proteomics-standard terminology** which differs from genomics conventions:
+//!
+//! ## Proteomics Definitions (used here):
+//!
+//! - **Peptide**: An amino acid sequence (e.g., "PEPTIDE")
+//! - **Precursor Ion**: A peptide + charge state + modifications (e.g., PEPTIDE[+2])
+//! - **Unique Peptide**: A peptide sequence mapping to only one protein
+//! - **Shared/Razor Peptide**: A peptide sequence mapping to multiple proteins
+//!
+//! ## Genomics Definitions (NOT used here):
+//!
+//! - **Unique**: Sequences mapping to only one genomic location (mappability)
+//! - **Multi-mapping**: Sequences mapping to multiple genomic locations
+//!
+//! In proteomics, a "unique peptide" refers to protein specificity, not genomic mappability.
+//! For example, a peptide that appears in multiple genomic loci (paralogous genes) may still
+//! be considered "unique" in proteomics if it distinguishes a single protein isoform.
+//!
+//! # Counting Conventions:
+//!
+//! - `total_precursors`: Counts all detected precursor ions (each charge state separately)
+//! - `unique_peptides`: Counts distinct peptide sequences (charge states collapsed)
+//! - `lfq_peptide_count`: MaxLFQ-specific count used in quantification (may include razor peptides)
 
 use crate::database::{binary_search_slice, IndexedDatabase, PeptideIx};
 use crate::mass::{composition, Composition, Tolerance, NEUTRON};
@@ -10,10 +36,16 @@ use crate::ml::{matrix::Matrix, retention_alignment::Alignment};
 use crate::scoring::Feature;
 use crate::spectrum::MS1Spectra;
 use dashmap::DashMap;
+use fnv::FnvHashMap;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+
+pub use sage_lfq::{
+    MaxLfqConfig, MaxLfqError, ProteinQuantResult, QuantificationResult, SkipReason,
+    SkippedProtein,
+};
 
 /// Minimum normalized spectral angle required to integrate a peak
 // const MIN_SPECTRAL_ANGLE: f64 = 0.70;
@@ -59,15 +91,94 @@ pub struct PeptideQuantTrace {
     pub time_warps: Vec<isize>,
 }
 
+impl sage_lfq::QuantTrace for PeptideQuantTrace {
+    fn intensities(&self) -> &[f64] {
+        &self.intensities
+    }
+
+    fn peptide_index(&self) -> usize {
+        self.peptide.0 as usize
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ProteinQuantTrace {
     pub accessions: Vec<Arc<str>>,
     pub decoy: bool,
     pub intensities: Vec<f64>,
     pub q_value: f32,
-    pub total_peptide_count: usize,
-    pub passing_peptide_count: usize,
+    /// Total number of precursor ions (distinct combinations of peptide sequence,
+    /// charge state, and modifications) identified for this protein, regardless
+    /// of q-value threshold.
+    ///
+    /// This corresponds to the proteomics concept of "peptide species" as defined
+    /// in the MaxLFQ algorithm. Each charge state (+2, +3, etc.) of the same
+    /// peptide sequence counts as a separate precursor.
+    ///
+    /// Example: The peptide PEPTIDE detected as [M+2H]²⁺ and [M+3H]³⁺ contributes
+    /// 2 to `total_precursors` but represents only 1 unique peptide sequence.
+    pub total_precursors: usize,
+    /// Number of unique peptide sequences (stripped of charge/modification state)
+    /// that passed the q-value threshold for this protein.
+    ///
+    /// **Proteomics-specific terminology**: In proteomics, "unique peptides" refers
+    /// to peptide sequences that map to a single protein (as opposed to "shared" or
+    /// "razor" peptides that map to multiple proteins). This differs from genomics
+    /// terminology where "unique" typically refers to mappability (sequences mapping
+    /// to one genomic location).
+    ///
+    /// Note: This metric counts distinct amino acid sequences only. The peptide
+    /// PEPTIDE with charge states +2 and +3 contributes only 1 to `unique_peptides`,
+    /// even though it represents 2 precursor ions in `total_precursors`.
+    ///
+    /// This field includes only peptides passing the FDR threshold (`max_precursor_q`),
+    /// enabling quality-controlled assessment of protein identification confidence.
+    pub unique_peptides: usize,
     pub peptide_indices: Vec<PeptideIx>,
+    pub run_coverage: Vec<usize>,
+}
+
+/// Enhanced protein quantification result combining MaxLFQ intensities with protein metadata.
+///
+/// This structure preserves important protein grouping information alongside the quantification
+/// results, enabling comprehensive quality control and downstream filtering based on FDR,
+/// peptide counts, and sample coverage.
+#[derive(Clone, Debug)]
+pub struct ProteinRollupResult {
+    /// Protein accessions (sorted and deduplicated)
+    pub accessions: Vec<Arc<str>>,
+    /// MaxLFQ quantification results
+    pub quant: ProteinQuantResult,
+    /// Protein-level q-value (minimum across constituent peptides)
+    pub q_value: f32,
+    /// Total number of precursor ions (distinct combinations of peptide sequence,
+    /// charge state, and modifications) identified for this protein, regardless
+    /// of q-value threshold.
+    ///
+    /// This corresponds to the proteomics concept of "peptide species" as defined
+    /// in the MaxLFQ algorithm. Each charge state (+2, +3, etc.) of the same
+    /// peptide sequence counts as a separate precursor.
+    ///
+    /// Example: The peptide PEPTIDE detected as [M+2H]²⁺ and [M+3H]³⁺ contributes
+    /// 2 to `total_precursors` but represents only 1 unique peptide sequence.
+    pub total_precursors: usize,
+    /// Number of unique peptide sequences (stripped of charge/modification state)
+    /// that passed the q-value threshold for this protein.
+    ///
+    /// **Proteomics-specific terminology**: In proteomics, "unique peptides" refers
+    /// to peptide sequences that map to a single protein (as opposed to "shared" or
+    /// "razor" peptides that map to multiple proteins). This differs from genomics
+    /// terminology where "unique" typically refers to mappability (sequences mapping
+    /// to one genomic location).
+    ///
+    /// Note: This metric counts distinct amino acid sequences only. The peptide
+    /// PEPTIDE with charge states +2 and +3 contributes only 1 to `unique_peptides`,
+    /// even though it represents 2 precursor ions in `total_precursors`.
+    ///
+    /// This field includes only peptides passing the FDR threshold (`max_precursor_q`),
+    /// enabling quality-controlled assessment of protein identification confidence.
+    pub unique_peptides: usize,
+    /// Number of contributing peptides per run (for batch effect diagnosis)
     pub run_coverage: Vec<usize>,
 }
 
@@ -91,8 +202,8 @@ impl ProteinGroupAccumulator {
                 decoy: false,
                 intensities: vec![0.0; run_count],
                 q_value: f32::INFINITY,
-                total_peptide_count: 0,
-                passing_peptide_count: 0,
+                total_precursors: 0,
+                unique_peptides: 0,
                 peptide_indices: Vec::new(),
                 run_coverage: vec![0; run_count],
             },
@@ -108,14 +219,14 @@ impl ProteinGroupAccumulator {
         max_precursor_q: f32,
         run_count: usize,
     ) {
-        self.trace.total_peptide_count += 1;
+        self.trace.total_precursors += 1;
         self.trace.q_value = self.trace.q_value.min(trace.peak.q_value);
         self.trace.decoy |= peptide_decoy;
 
         if trace.peak.q_value <= max_precursor_q {
             let is_new_peptide = self.peptides.insert(trace.peptide);
             if is_new_peptide {
-                self.trace.passing_peptide_count += 1;
+                self.trace.unique_peptides += 1;
             }
             for (run_idx, intensity) in trace
                 .intensities
@@ -203,9 +314,7 @@ impl ProteinQuantTrace {
                     peptide
                         .proteins
                         .iter()
-                        .map(|acc| {
-                            Arc::<str>::from(format!("{}{}#TRACE", decoy_tag, acc.as_ref()))
-                        })
+                        .map(|acc| Arc::<str>::from(format!("{}{}#TRACE", decoy_tag, acc.as_ref())))
                         .collect()
                 }
                 (false, false) => peptide.proteins.clone(),
@@ -248,6 +357,219 @@ impl ProteinQuantTrace {
     ) -> impl Iterator<Item = &'a ProteinQuantTrace> + 'a {
         proteins.values()
     }
+}
+
+fn build_solver_groups(
+    index_lookup: &FnvHashMap<PeptideIx, Vec<usize>>,
+    proteins: &BTreeMap<Vec<Arc<str>>, ProteinQuantTrace>,
+    config: &MaxLfqConfig,
+) -> Vec<(Vec<String>, Vec<usize>)> {
+    ProteinQuantTrace::ordered_groups(proteins)
+        .filter_map(|(accessions, trace)| {
+            if trace.decoy {
+                return None;
+            }
+
+            let mut peptide_rows: Vec<usize> = Vec::new();
+            let mut observed_peptides = 0usize;
+
+            for ix in &trace.peptide_indices {
+                if let Some(rows) = index_lookup.get(ix) {
+                    observed_peptides += 1;
+                    peptide_rows.extend(rows.iter().copied());
+                }
+            }
+
+            if peptide_rows.is_empty() {
+                return None;
+            }
+
+            // Filter proteins that don't meet minimum peptide threshold
+            // These will be silently skipped by the MaxLFQ solver if they reach it
+            if observed_peptides < config.min_peptides_per_ratio {
+                return None;
+            }
+
+            peptide_rows.sort_unstable();
+
+            let accession_strings = accessions
+                .iter()
+                .map(|acc| acc.as_ref().to_string())
+                .collect::<Vec<_>>();
+
+            Some((accession_strings, peptide_rows))
+        })
+        .collect()
+}
+
+/// Check if a peptide quantification trace passes the FDR threshold for protein quantification.
+///
+/// Traces are excluded if they are decoys or if their precursor q-value exceeds the threshold.
+#[inline]
+fn passes_fdr_filter(trace: &PeptideQuantTrace, max_precursor_q: f32) -> bool {
+    !trace.decoy && trace.peak.q_value <= max_precursor_q
+}
+
+/// Convert protein-level quantification traces into MaxLFQ protein roll-up results.
+///
+/// The helper prepares the deterministic `(Vec<String>, Vec<usize>)` tuples required
+/// by [`sage_lfq::quantify_proteins`] by resolving each peptide identifier to the
+/// corresponding position inside the provided [`PeptideQuantTrace`] slice. Protein
+/// groups flagged as decoys or without any matched peptides are ignored so the
+/// downstream solver only evaluates target proteins with usable evidence.
+///
+/// Proteins with fewer peptides than `config.min_peptides_per_ratio` are filtered
+/// out before quantification to prevent errors in the MaxLFQ solver. Only traces
+/// whose precursor q-value is at or below `max_precursor_q` contribute to the
+/// MaxLFQ system so high-q evidence cannot bypass FDR filtering during roll-up.
+///
+/// Returns [`ProteinRollupResult`] which combines MaxLFQ intensities with protein
+/// metadata (q-value, peptide counts, run coverage) for comprehensive quality control.
+pub fn quantify_protein_groups(
+    traces: &[PeptideQuantTrace],
+    proteins: &BTreeMap<Vec<Arc<str>>, ProteinQuantTrace>,
+    max_precursor_q: f32,
+    config: MaxLfqConfig,
+) -> Result<Vec<ProteinRollupResult>, MaxLfqError> {
+    // Validate q-value threshold is in valid range
+    if !(0.0..=1.0).contains(&max_precursor_q) {
+        return Err(MaxLfqError::InvalidParameter(format!(
+            "max_precursor_q must be in [0.0, 1.0], got {}",
+            max_precursor_q
+        )));
+    }
+
+    let mut index_lookup: FnvHashMap<PeptideIx, Vec<usize>> = FnvHashMap::default();
+
+    for (row, trace) in traces.iter().enumerate() {
+        if !passes_fdr_filter(trace, max_precursor_q) {
+            continue;
+        }
+
+        index_lookup.entry(trace.peptide).or_default().push(row);
+    }
+
+    // Debug assertion: verify no high-q traces leaked through
+    #[cfg(debug_assertions)]
+    {
+        for rows in index_lookup.values() {
+            for &row in rows {
+                debug_assert!(
+                    passes_fdr_filter(&traces[row], max_precursor_q),
+                    "High-q trace (q={}) leaked into index_lookup at row {}",
+                    traces[row].peak.q_value,
+                    row
+                );
+            }
+        }
+    }
+
+    // Log how many traces were filtered by q-value threshold
+    let total_target_traces = traces.iter().filter(|t| !t.decoy).count();
+    let passing_traces: usize = index_lookup.values().map(|v| v.len()).sum();
+    let filtered_traces = total_target_traces - passing_traces;
+
+    if filtered_traces > 0 {
+        log::info!(
+            "filtered {} precursor traces (q > {:.3}) before MaxLFQ quantification",
+            filtered_traces,
+            max_precursor_q
+        );
+    }
+
+    if index_lookup.is_empty() {
+        log::warn!(
+            "all {} target traces were filtered by q-value threshold ({:.3}); \
+             consider relaxing max_precursor_q or reviewing upstream FDR control",
+            total_target_traces,
+            max_precursor_q
+        );
+        return Ok(Vec::new());
+    }
+
+    let total_proteins = proteins.len();
+    let groups = build_solver_groups(&index_lookup, proteins, &config);
+    let filtered_count = total_proteins - groups.len();
+
+    if filtered_count > 0 {
+        log::info!(
+            "filtered {} protein groups (decoys or < {} peptides)",
+            filtered_count,
+            config.min_peptides_per_ratio
+        );
+    }
+
+    if groups.is_empty() {
+        log::warn!("no protein groups passed min_peptides filter");
+        return Ok(Vec::new());
+    }
+
+    log::info!("quantifying {} protein groups with MaxLFQ", groups.len());
+
+    // Run MaxLFQ quantification
+    let result = sage_lfq::quantify_proteins(traces, &groups, config)?;
+
+    // Report skipped proteins with explicit reasons
+    if !result.skipped.is_empty() {
+        let skipped_examples: Vec<String> = result
+            .skipped
+            .iter()
+            .take(5)
+            .map(|s| format!("{}({})", s.protein_ids.join(";"), match s.reason {
+                sage_lfq::SkipReason::DisconnectedGraph => "disconnected",
+                sage_lfq::SkipReason::InsufficientPeptides => "insufficient peptides",
+            }))
+            .collect();
+
+        if result.skipped.len() <= 5 {
+            log::warn!(
+                "skipped {} protein groups: {}",
+                result.skipped.len(),
+                skipped_examples.join(", ")
+            );
+        } else {
+            log::warn!(
+                "skipped {} protein groups; examples: {}",
+                result.skipped.len(),
+                skipped_examples.join(", ")
+            );
+        }
+    }
+
+    let quant_results = result.quantified;
+
+    // Zip quantification results with protein metadata
+    // Match by protein IDs to preserve all metadata
+    let mut rollup_results = Vec::with_capacity(quant_results.len());
+    
+    for quant in quant_results {
+        // Convert protein IDs to Arc<str> for lookup
+        let protein_key: Vec<Arc<str>> = quant
+            .protein_ids
+            .iter()
+            .map(|s| Arc::<str>::from(s.as_str()))
+            .collect();
+
+        // Find matching protein trace metadata
+        if let Some(trace) = proteins.get(&protein_key) {
+            rollup_results.push(ProteinRollupResult {
+                accessions: trace.accessions.clone(),
+                quant,
+                q_value: trace.q_value,
+                total_precursors: trace.total_precursors,
+                unique_peptides: trace.unique_peptides,
+                run_coverage: trace.run_coverage.clone(),
+            });
+        } else {
+            // This should never happen - quantified protein must have trace metadata
+            log::warn!(
+                "MaxLFQ quantified protein not found in traces: {:?}",
+                protein_key
+            );
+        }
+    }
+
+    Ok(rollup_results)
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

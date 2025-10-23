@@ -2978,6 +2978,7 @@ dependencies = [
  "ryu",
  "sage-cloudpath",
  "sage-core",
+ "sage-lfq",
  "serde",
  "serde_json",
  "sysinfo",
@@ -3023,6 +3024,7 @@ dependencies = [
  "quickcheck_macros",
  "rayon",
  "regex",
+ "sage-lfq",
  "serde",
 ]
 
@@ -3033,7 +3035,6 @@ dependencies = [
  "approx 0.5.1",
  "nalgebra 0.32.6",
  "rayon",
- "sage-core",
  "serde",
  "sprs",
  "statrs",

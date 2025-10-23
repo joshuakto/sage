@@ -1,4 +1,4 @@
-use sage_core::lfq::PeptideQuantTrace;
+use crate::QuantTrace;
 use sprs::{CsMat, TriMat};
 
 pub struct IntensityMatrix {
@@ -12,11 +12,11 @@ pub struct IntensityMatrix {
 
 impl IntensityMatrix {
     /// Convert peptide traces to sparse log2 intensity matrix
-    pub fn from_peptide_traces(traces: &[PeptideQuantTrace], n_samples: usize) -> Self {
+    pub fn from_peptide_traces<T: QuantTrace>(traces: &[T], n_samples: usize) -> Self {
         let mut triplets = TriMat::new((traces.len(), n_samples));
 
         for (row, trace) in traces.iter().enumerate() {
-            for (col, &intensity) in trace.intensities.iter().take(n_samples).enumerate() {
+            for (col, &intensity) in trace.intensities().iter().take(n_samples).enumerate() {
                 if intensity > 0.0 {
                     let value = (intensity as f32).log2();
                     triplets.add_triplet(row, col, value);
@@ -26,7 +26,10 @@ impl IntensityMatrix {
 
         Self {
             matrix: triplets.to_csr(),
-            peptide_ids: traces.iter().map(|t| format!("{}", t.peptide.0)).collect(),
+            peptide_ids: traces
+                .iter()
+                .map(|t| t.peptide_index().to_string())
+                .collect(),
             sample_names: (0..n_samples).map(|i| format!("S{}", i)).collect(),
             n_peptides: traces.len(),
             n_samples,
