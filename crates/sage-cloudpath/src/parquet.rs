@@ -423,8 +423,8 @@ pub fn build_lfq_protein_schema() -> parquet::errors::Result<Type> {
         message schema {
             required byte_array proteins (utf8);
             required float q_value;
-            required int32 total_peptides;
-            required int32 passing_peptides;
+            required int32 total_precursors;
+            required int32 unique_peptides;
             required int32 lfq_peptide_count;
             required byte_array filename (utf8);
             required float intensity;
@@ -609,24 +609,24 @@ pub fn serialize_lfq_proteins(
         col.close()?;
     }
 
-    // Column 3: total_peptides
+    // Column 3: total_precursors
     if let Some(mut col) = rg.next_column()? {
         let mut values = Vec::with_capacity(proteins.len() * filenames.len());
         for protein in proteins {
             for _ in filenames {
-                values.push(protein.total_peptide_count as i32);
+                values.push(protein.total_precursors as i32);
             }
         }
         col.typed::<Int32Type>().write_batch(&values, None, None)?;
         col.close()?;
     }
 
-    // Column 4: passing_peptides
+    // Column 4: unique_peptides
     if let Some(mut col) = rg.next_column()? {
         let mut values = Vec::with_capacity(proteins.len() * filenames.len());
         for protein in proteins {
             for _ in filenames {
-                values.push(protein.passing_peptide_count as i32);
+                values.push(protein.unique_peptides as i32);
             }
         }
         col.typed::<Int32Type>().write_batch(&values, None, None)?;
@@ -1022,8 +1022,8 @@ mod tests {
                 sample_coverage: vec![true, false],  // run_b not covered by MaxLFQ
             },
             q_value: 0.123,
-            total_peptide_count: 5,
-            passing_peptide_count: 4,
+            total_precursors: 5,
+            unique_peptides: 4,
             run_coverage: vec![2, 0],  // run_b has 0 contributors (not covered)
         }];
 
@@ -1032,13 +1032,13 @@ mod tests {
         let mut rows = reader.get_row_iter(None)?;
 
         // Verify first row (run_a)
-        // Schema: proteins, q_value, total_peptides, passing_peptides, lfq_peptide_count,
+        // Schema: proteins, q_value, total_precursors, unique_peptides, lfq_peptide_count,
         //         filename, intensity, covered, contributors
         let first = rows.next().expect("protein row")?;
         assert_eq!(first.get_string(0)?, "P1;P2");                           // proteins
         assert!((first.get_float(1)? - 0.123).abs() < f32::EPSILON);         // q_value
-        assert_eq!(first.get_int(2)?, 5);                                    // total_peptides
-        assert_eq!(first.get_int(3)?, 4);                                    // passing_peptides
+        assert_eq!(first.get_int(2)?, 5);                                    // total_precursors
+        assert_eq!(first.get_int(3)?, 4);                                    // unique_peptides
         assert_eq!(first.get_int(4)?, 3);                                    // lfq_peptide_count
         assert_eq!(first.get_string(5)?, "run_a");                           // filename
         assert!((first.get_float(6)? - 123.0).abs() < f32::EPSILON);         // intensity

@@ -95,7 +95,7 @@ fn single_peptide_proteins_are_filtered_not_fatal() {
 #[test]
 fn peptide_counts_distinguish_total_vs_passing() {
     // Regression test for bug where pre-filtering traces caused
-    // total_peptide_count to equal passing_peptide_count
+    // total_precursors to equal unique_peptides
     let run_count = 2;
     let db = fake_database(vec![
         fake_peptide("PEPA", &["P12345"], false),
@@ -119,16 +119,16 @@ fn peptide_counts_distinguish_total_vs_passing() {
 
     // Critical assertions: these will FAIL with the buggy pre-filtering
     assert_eq!(
-        protein.total_peptide_count, 3,
-        "Should count ALL peptides (including those above q-value threshold)"
+        protein.total_precursors, 3,
+        "Should count ALL precursors (including those above q-value threshold)"
     );
     assert_eq!(
-        protein.passing_peptide_count, 2,
-        "Should count only peptides passing q-value threshold"
+        protein.unique_peptides, 2,
+        "Should count only unique peptides passing q-value threshold"
     );
     assert!(
-        protein.total_peptide_count > protein.passing_peptide_count,
-        "Bug check: total MUST exceed passing when some peptides have high q-values. \
+        protein.total_precursors > protein.unique_peptides,
+        "Bug check: total precursors MUST exceed unique peptides when some precursors have high q-values. \
          If this fails, pre-filtering is removing high q-value traces before aggregation."
     );
 
@@ -243,8 +243,8 @@ fn intensity_rollup_sums_targets() {
     assert!(!target.decoy);
     assert_eq!(target.intensities, vec![150.0, 50.0, 30.0]);
     assert!((target.q_value - 0.004).abs() < f32::EPSILON);
-    assert_eq!(target.total_peptide_count, 2);
-    assert_eq!(target.passing_peptide_count, 2);
+    assert_eq!(target.total_precursors, 2);
+    assert_eq!(target.unique_peptides, 2);
     assert_eq!(target.peptide_indices, vec![PeptideIx(0), PeptideIx(1)]);
     assert_eq!(target.run_coverage, vec![2, 1, 1]);
 }
@@ -269,8 +269,8 @@ fn decoy_peptides_are_tracked_separately() {
         .get(&target_accession)
         .expect("target protein missing");
     assert!(!target.decoy);
-    assert_eq!(target.total_peptide_count, 1);
-    assert_eq!(target.passing_peptide_count, 1);
+    assert_eq!(target.total_precursors, 1);
+    assert_eq!(target.unique_peptides, 1);
     assert_eq!(target.peptide_indices, vec![PeptideIx(0)]);
     assert_eq!(target.run_coverage, vec![1, 1, 0]);
     assert_eq!(target.intensities, vec![100.0, 10.0, 0.0]);
@@ -284,8 +284,8 @@ fn decoy_peptides_are_tracked_separately() {
     assert!(decoy.decoy);
     assert_eq!(proteins.len(), 2);
     assert_eq!(decoy.accessions, decoy_accession);
-    assert_eq!(decoy.total_peptide_count, 1);
-    assert_eq!(decoy.passing_peptide_count, 1);
+    assert_eq!(decoy.total_precursors, 1);
+    assert_eq!(decoy.unique_peptides, 1);
     assert_eq!(decoy.peptide_indices, vec![PeptideIx(1)]);
     assert_eq!(decoy.run_coverage, vec![1, 1, 0]);
     assert_eq!(decoy.intensities, vec![12.0, 8.0, 0.0]);
@@ -315,8 +315,8 @@ fn fasta_provided_decoys_keep_traces_and_peptides_separate() {
     assert!(!target.decoy);
     assert_eq!(target.accessions, target_accession);
     assert_eq!(target.intensities, vec![75.0, 25.0]);
-    assert_eq!(target.total_peptide_count, 1);
-    assert_eq!(target.passing_peptide_count, 1);
+    assert_eq!(target.total_precursors, 1);
+    assert_eq!(target.unique_peptides, 1);
     assert_eq!(target.peptide_indices, vec![PeptideIx(0)]);
     assert_eq!(target.run_coverage, vec![1, 1]);
 
@@ -330,8 +330,8 @@ fn fasta_provided_decoys_keep_traces_and_peptides_separate() {
     assert!(trace_decoy.decoy);
     assert_eq!(trace_decoy.accessions, trace_decoy_accession);
     assert_eq!(trace_decoy.intensities, vec![30.0, 0.0]);
-    assert_eq!(trace_decoy.total_peptide_count, 1);
-    assert_eq!(trace_decoy.passing_peptide_count, 1);
+    assert_eq!(trace_decoy.total_precursors, 1);
+    assert_eq!(trace_decoy.unique_peptides, 1);
     assert_eq!(trace_decoy.peptide_indices, vec![PeptideIx(0)]);
     assert_eq!(trace_decoy.run_coverage, vec![1, 0]);
 
@@ -342,8 +342,8 @@ fn fasta_provided_decoys_keep_traces_and_peptides_separate() {
     assert!(fasta_decoy.decoy);
     assert_eq!(fasta_decoy.accessions, fasta_decoy_accession);
     assert_eq!(fasta_decoy.intensities, vec![12.0, 3.0]);
-    assert_eq!(fasta_decoy.total_peptide_count, 1);
-    assert_eq!(fasta_decoy.passing_peptide_count, 1);
+    assert_eq!(fasta_decoy.total_precursors, 1);
+    assert_eq!(fasta_decoy.unique_peptides, 1);
     assert_eq!(fasta_decoy.peptide_indices, vec![PeptideIx(1)]);
     assert_eq!(fasta_decoy.run_coverage, vec![1, 1]);
 
@@ -413,8 +413,8 @@ fn decoy_traces_for_target_peptides_form_separate_groups() {
     assert_eq!(proteins.len(), 2);
     assert!(!target.decoy);
     assert_eq!(target.intensities, vec![100.0, 25.0]);
-    assert_eq!(target.total_peptide_count, 1);
-    assert_eq!(target.passing_peptide_count, 1);
+    assert_eq!(target.total_precursors, 1);
+    assert_eq!(target.unique_peptides, 1);
 
     let decoy_accession = vec![Arc::<str>::from(format!(
         "{}{}#TRACE",
@@ -426,8 +426,8 @@ fn decoy_traces_for_target_peptides_form_separate_groups() {
     assert!(decoy.decoy);
     assert_eq!(decoy.accessions, decoy_accession);
     assert_eq!(decoy.intensities, vec![12.5, 7.5]);
-    assert_eq!(decoy.total_peptide_count, 1);
-    assert_eq!(decoy.passing_peptide_count, 1);
+    assert_eq!(decoy.total_precursors, 1);
+    assert_eq!(decoy.unique_peptides, 1);
 }
 
 #[test]
@@ -484,8 +484,8 @@ fn q_value_filtering_excludes_high_q_peptides() {
     let target = proteins.get(&accession).expect("target protein missing");
 
     assert!(!target.decoy);
-    assert_eq!(target.total_peptide_count, 3);
-    assert_eq!(target.passing_peptide_count, 2);
+    assert_eq!(target.total_precursors, 3);
+    assert_eq!(target.unique_peptides, 2);
     assert_eq!(target.peptide_indices, vec![PeptideIx(0), PeptideIx(1)]);
     assert_eq!(target.intensities, vec![150.0, 50.0, 30.0]);
     assert_eq!(target.run_coverage, vec![2, 1, 1]);
@@ -511,13 +511,13 @@ fn run_coverage_counts_unique_peptides_per_run() {
     assert_eq!(target.intensities, vec![5.0, 10.0]);
     assert_eq!(target.run_coverage, vec![1, 1]);
     assert_eq!(target.peptide_indices, vec![PeptideIx(0)]);
-    assert_eq!(target.total_peptide_count, 2);
+    assert_eq!(target.total_precursors, 2);
     // The passing peptide count mirrors the number of unique peptide indices.
-    assert_eq!(target.passing_peptide_count, target.peptide_indices.len());
+    assert_eq!(target.unique_peptides, target.peptide_indices.len());
 }
 
 #[test]
-fn passing_peptide_count_matches_unique_peptides_without_charge_combining() {
+fn unique_peptides_matches_unique_peptides_without_charge_combining() {
     let run_count = 1;
     let db = fake_database(vec![fake_peptide("PEPA", &["P12345"], false)]);
     let traces = vec![
@@ -558,9 +558,9 @@ fn passing_peptide_count_matches_unique_peptides_without_charge_combining() {
         .get(&accession)
         .expect("expected protein entry to exist");
 
-    assert_eq!(trace.total_peptide_count, 3);
+    assert_eq!(trace.total_precursors, 3);
     assert_eq!(trace.peptide_indices.len(), 1);
-    assert_eq!(trace.passing_peptide_count, 1);
+    assert_eq!(trace.unique_peptides, 1);
     assert_eq!(trace.intensities, vec![450.0]);
     assert_eq!(trace.run_coverage, vec![1]);
 }
@@ -605,8 +605,8 @@ fn digest_protein_map(
             "{}|{}|{}|{}|{:.6}|{}|{}|{}",
             accession_list,
             trace.decoy,
-            trace.total_peptide_count,
-            trace.passing_peptide_count,
+            trace.total_precursors,
+            trace.unique_peptides,
             trace.q_value,
             peptides,
             intensities,
@@ -670,8 +670,8 @@ fn multiple_charge_states_are_quantified_by_maxlfq() {
     accession.sort_unstable();
     let protein_trace = groups.get(&accession).expect("protein missing");
     assert_eq!(protein_trace.intensities, vec![530.0, 265.0]); // Sum of all traces
-    assert_eq!(protein_trace.total_peptide_count, 4); // 4 traces total
-    assert_eq!(protein_trace.passing_peptide_count, 2); // 2 unique peptides
+    assert_eq!(protein_trace.total_precursors, 4); // 4 traces total
+    assert_eq!(protein_trace.unique_peptides, 2); // 2 unique peptides
 
     // Now verify MaxLFQ receives all 4 traces (not just 2)
     let results = quantify_protein_groups(
@@ -758,9 +758,9 @@ fn high_q_charge_states_are_excluded_from_maxlfq() {
     );
 
     // Additional validation
-    assert_eq!(protein.total_peptide_count, 2, "Should count both traces");
+    assert_eq!(protein.total_precursors, 2, "Should count both traces");
     assert_eq!(
-        protein.passing_peptide_count, 1,
+        protein.unique_peptides, 1,
         "Only one peptide passes q-value threshold"
     );
     assert!(protein.quant.sample_coverage.iter().all(|covered| *covered));
@@ -780,8 +780,8 @@ fn mixed_quality_charge_states_honors_fdr_at_quantification() {
     // - Threshold: max_precursor_q = 0.01
     //
     // Expected behavior:
-    // 1. group_by_accession counts all 3 traces as total_peptide_count
-    // 2. Only 2 unique peptides (PEPA, PEPB) pass threshold → passing_peptide_count = 2
+    // 1. group_by_accession counts all 3 traces as total_precursors
+    // 2. Only 2 unique peptides (PEPA, PEPB) pass threshold → unique_peptides = 2
     // 3. MaxLFQ receives exactly 2 traces (PEPA+2, PEPB+2), NOT 3
     //
     // This test validates the complete pipeline from protein grouping through quantification.
@@ -827,11 +827,11 @@ fn mixed_quality_charge_states_honors_fdr_at_quantification() {
     let protein_trace = groups.values().next().expect("protein group exists");
 
     assert_eq!(
-        protein_trace.total_peptide_count, 3,
+        protein_trace.total_precursors, 3,
         "Should count all 3 traces in total"
     );
     assert_eq!(
-        protein_trace.passing_peptide_count, 2,
+        protein_trace.unique_peptides, 2,
         "Only 2 unique peptides pass threshold (PEPA and PEPB)"
     );
     assert_eq!(
@@ -865,9 +865,9 @@ fn mixed_quality_charge_states_honors_fdr_at_quantification() {
     );
 
     // Metadata should reflect the full picture
-    assert_eq!(protein.total_peptide_count, 3, "Metadata preserves total count");
+    assert_eq!(protein.total_precursors, 3, "Metadata preserves total count");
     assert_eq!(
-        protein.passing_peptide_count, 2,
+        protein.unique_peptides, 2,
         "Metadata shows 2 peptides passed"
     );
 

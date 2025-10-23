@@ -1,8 +1,34 @@
-//! Label-free quantification routines.
+//! Label-free quantification (LFQ) for proteomics data using the MaxLFQ algorithm.
 //!
 //! Protein-level aggregation relies on deterministic data structures so repeated analyses
 //! produce bytewise-identical outputs that downstream reporting and regulatory pipelines can
 //! reproduce.
+//!
+//! # Terminology Note: Proteomics vs. Genomics
+//!
+//! This module uses **proteomics-standard terminology** which differs from genomics conventions:
+//!
+//! ## Proteomics Definitions (used here):
+//!
+//! - **Peptide**: An amino acid sequence (e.g., "PEPTIDE")
+//! - **Precursor Ion**: A peptide + charge state + modifications (e.g., PEPTIDE[+2])
+//! - **Unique Peptide**: A peptide sequence mapping to only one protein
+//! - **Shared/Razor Peptide**: A peptide sequence mapping to multiple proteins
+//!
+//! ## Genomics Definitions (NOT used here):
+//!
+//! - **Unique**: Sequences mapping to only one genomic location (mappability)
+//! - **Multi-mapping**: Sequences mapping to multiple genomic locations
+//!
+//! In proteomics, a "unique peptide" refers to protein specificity, not genomic mappability.
+//! For example, a peptide that appears in multiple genomic loci (paralogous genes) may still
+//! be considered "unique" in proteomics if it distinguishes a single protein isoform.
+//!
+//! # Counting Conventions:
+//!
+//! - `total_precursors`: Counts all detected precursor ions (each charge state separately)
+//! - `unique_peptides`: Counts distinct peptide sequences (charge states collapsed)
+//! - `lfq_peptide_count`: MaxLFQ-specific count used in quantification (may include razor peptides)
 
 use crate::database::{binary_search_slice, IndexedDatabase, PeptideIx};
 use crate::mass::{composition, Composition, Tolerance, NEUTRON};
@@ -81,8 +107,33 @@ pub struct ProteinQuantTrace {
     pub decoy: bool,
     pub intensities: Vec<f64>,
     pub q_value: f32,
-    pub total_peptide_count: usize,
-    pub passing_peptide_count: usize,
+    /// Total number of precursor ions (distinct combinations of peptide sequence,
+    /// charge state, and modifications) identified for this protein, regardless
+    /// of q-value threshold.
+    ///
+    /// This corresponds to the proteomics concept of "peptide species" as defined
+    /// in the MaxLFQ algorithm. Each charge state (+2, +3, etc.) of the same
+    /// peptide sequence counts as a separate precursor.
+    ///
+    /// Example: The peptide PEPTIDE detected as [M+2H]²⁺ and [M+3H]³⁺ contributes
+    /// 2 to `total_precursors` but represents only 1 unique peptide sequence.
+    pub total_precursors: usize,
+    /// Number of unique peptide sequences (stripped of charge/modification state)
+    /// that passed the q-value threshold for this protein.
+    ///
+    /// **Proteomics-specific terminology**: In proteomics, "unique peptides" refers
+    /// to peptide sequences that map to a single protein (as opposed to "shared" or
+    /// "razor" peptides that map to multiple proteins). This differs from genomics
+    /// terminology where "unique" typically refers to mappability (sequences mapping
+    /// to one genomic location).
+    ///
+    /// Note: This metric counts distinct amino acid sequences only. The peptide
+    /// PEPTIDE with charge states +2 and +3 contributes only 1 to `unique_peptides`,
+    /// even though it represents 2 precursor ions in `total_precursors`.
+    ///
+    /// This field includes only peptides passing the FDR threshold (`max_precursor_q`),
+    /// enabling quality-controlled assessment of protein identification confidence.
+    pub unique_peptides: usize,
     pub peptide_indices: Vec<PeptideIx>,
     pub run_coverage: Vec<usize>,
 }
@@ -100,10 +151,33 @@ pub struct ProteinRollupResult {
     pub quant: ProteinQuantResult,
     /// Protein-level q-value (minimum across constituent peptides)
     pub q_value: f32,
-    /// Total peptide count before q-value filtering
-    pub total_peptide_count: usize,
-    /// Peptide count after q-value filtering
-    pub passing_peptide_count: usize,
+    /// Total number of precursor ions (distinct combinations of peptide sequence,
+    /// charge state, and modifications) identified for this protein, regardless
+    /// of q-value threshold.
+    ///
+    /// This corresponds to the proteomics concept of "peptide species" as defined
+    /// in the MaxLFQ algorithm. Each charge state (+2, +3, etc.) of the same
+    /// peptide sequence counts as a separate precursor.
+    ///
+    /// Example: The peptide PEPTIDE detected as [M+2H]²⁺ and [M+3H]³⁺ contributes
+    /// 2 to `total_precursors` but represents only 1 unique peptide sequence.
+    pub total_precursors: usize,
+    /// Number of unique peptide sequences (stripped of charge/modification state)
+    /// that passed the q-value threshold for this protein.
+    ///
+    /// **Proteomics-specific terminology**: In proteomics, "unique peptides" refers
+    /// to peptide sequences that map to a single protein (as opposed to "shared" or
+    /// "razor" peptides that map to multiple proteins). This differs from genomics
+    /// terminology where "unique" typically refers to mappability (sequences mapping
+    /// to one genomic location).
+    ///
+    /// Note: This metric counts distinct amino acid sequences only. The peptide
+    /// PEPTIDE with charge states +2 and +3 contributes only 1 to `unique_peptides`,
+    /// even though it represents 2 precursor ions in `total_precursors`.
+    ///
+    /// This field includes only peptides passing the FDR threshold (`max_precursor_q`),
+    /// enabling quality-controlled assessment of protein identification confidence.
+    pub unique_peptides: usize,
     /// Number of contributing peptides per run (for batch effect diagnosis)
     pub run_coverage: Vec<usize>,
 }
@@ -128,8 +202,8 @@ impl ProteinGroupAccumulator {
                 decoy: false,
                 intensities: vec![0.0; run_count],
                 q_value: f32::INFINITY,
-                total_peptide_count: 0,
-                passing_peptide_count: 0,
+                total_precursors: 0,
+                unique_peptides: 0,
                 peptide_indices: Vec::new(),
                 run_coverage: vec![0; run_count],
             },
@@ -145,14 +219,14 @@ impl ProteinGroupAccumulator {
         max_precursor_q: f32,
         run_count: usize,
     ) {
-        self.trace.total_peptide_count += 1;
+        self.trace.total_precursors += 1;
         self.trace.q_value = self.trace.q_value.min(trace.peak.q_value);
         self.trace.decoy |= peptide_decoy;
 
         if trace.peak.q_value <= max_precursor_q {
             let is_new_peptide = self.peptides.insert(trace.peptide);
             if is_new_peptide {
-                self.trace.passing_peptide_count += 1;
+                self.trace.unique_peptides += 1;
             }
             for (run_idx, intensity) in trace
                 .intensities
@@ -482,8 +556,8 @@ pub fn quantify_protein_groups(
                 accessions: trace.accessions.clone(),
                 quant,
                 q_value: trace.q_value,
-                total_peptide_count: trace.total_peptide_count,
-                passing_peptide_count: trace.passing_peptide_count,
+                total_precursors: trace.total_precursors,
+                unique_peptides: trace.unique_peptides,
                 run_coverage: trace.run_coverage.clone(),
             });
         } else {

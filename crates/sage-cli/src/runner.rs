@@ -1312,8 +1312,8 @@ impl Runner {
         let mut headers = csv::ByteRecord::new();
         headers.push_field(b"proteins");
         headers.push_field(b"q_value");
-        headers.push_field(b"total_peptides");
-        headers.push_field(b"passing_peptides");
+        headers.push_field(b"total_precursors");
+        headers.push_field(b"unique_peptides");
         headers.push_field(b"lfq_peptide_count");
         
         // Intensity columns
@@ -1347,8 +1347,8 @@ impl Runner {
             
             // Protein metadata
             record.push_field(ryu::Buffer::new().format(result.q_value).as_bytes());
-            record.push_field(itoa::Buffer::new().format(result.total_peptide_count).as_bytes());
-            record.push_field(itoa::Buffer::new().format(result.passing_peptide_count).as_bytes());
+            record.push_field(itoa::Buffer::new().format(result.total_precursors).as_bytes());
+            record.push_field(itoa::Buffer::new().format(result.unique_peptides).as_bytes());
             record.push_field(itoa::Buffer::new().format(result.quant.peptide_count).as_bytes());
 
             // MaxLFQ intensities
