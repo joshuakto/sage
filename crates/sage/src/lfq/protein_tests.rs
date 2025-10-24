@@ -4,7 +4,7 @@ use crate::{
     database::{IndexedDatabase, PeptideIx},
     enzyme::Position,
     lfq::{
-        quantify_protein_groups, MaxLfqConfig, Peak, PeptideQuantTrace, PrecursorId,
+        quantify_protein_groups, MaxLfqConfig, MaxLfqError, Peak, PeptideQuantTrace, PrecursorId,
         ProteinQuantTrace,
     },
     ml::matrix::Matrix,
@@ -625,7 +625,7 @@ fn multiple_charge_states_are_quantified_by_maxlfq() {
         fake_peptide("PEPA", &["P12345"], false),
         fake_peptide("PEPB", &["P12345"], false),
     ]);
-    
+
     // Create traces with multiple charge states per peptide
     let traces = vec![
         // PEPA with charge 2
@@ -686,11 +686,11 @@ fn multiple_charge_states_are_quantified_by_maxlfq() {
         },
     )
     .expect("quantification should succeed");
-    
+
     assert_eq!(results.len(), 1);
     let protein = &results[0];
     assert_eq!(protein.quant.protein_ids, vec!["P12345".to_string()]);
-    
+
     // The peptide_count should be 4 (all charge state traces), not 2
     // This verifies that all traces made it through to MaxLFQ
     assert_eq!(protein.quant.peptide_count, 4);
@@ -912,4 +912,176 @@ fn protein_grouping_is_deterministic_across_input_orders() {
 
     assert_eq!(canonical_digest, reversed_digest);
     assert_eq!(canonical_digest, rotated_digest);
+}
+
+#[test]
+fn global_normalization_propagates_to_protein_rollup() {
+    let run_count = 3;
+
+    // Create systematic loading difference: run 0=1x, run 1=2x, run 2=4x
+    let db = fake_database(vec![
+        fake_peptide("PEP_A", &["P12345"], false),
+        fake_peptide("PEP_B", &["P12345"], false),
+        fake_peptide("PEP_C", &["P12345"], false),
+    ]);
+
+    let traces = vec![
+        fake_trace(0, false, 0.005, &[100.0, 200.0, 400.0]),
+        fake_trace(1, false, 0.006, &[150.0, 300.0, 600.0]),
+        fake_trace(2, false, 0.007, &[120.0, 240.0, 480.0]),
+    ];
+
+    let max_precursor_q = 0.01;
+    let groups = ProteinQuantTrace::group_by_accession(&db, &traces, run_count, max_precursor_q);
+
+    // Test WITH normalization
+    let results_normalized = quantify_protein_groups(
+        &traces,
+        &groups,
+        max_precursor_q,
+        MaxLfqConfig {
+            min_peptides_per_ratio: 2,
+            min_samples_for_protein: 1,
+            use_global_normalization: true,
+            reference_sample: None,
+        },
+    )
+    .expect("normalized rollup");
+
+    // Test WITHOUT normalization
+    let results_raw = quantify_protein_groups(
+        &traces,
+        &groups,
+        max_precursor_q,
+        MaxLfqConfig {
+            min_peptides_per_ratio: 2,
+            min_samples_for_protein: 1,
+            use_global_normalization: false,
+            reference_sample: None,
+        },
+    )
+    .expect("raw rollup");
+
+    assert_eq!(results_normalized.len(), 1);
+    assert_eq!(results_raw.len(), 1);
+
+    let normalized = &results_normalized[0].quant;
+    let raw = &results_raw[0].quant;
+
+    // Normalized intensities should be more similar across runs
+    let norm_cv = coefficient_of_variation(&normalized.lfq_intensities);
+    let raw_cv = coefficient_of_variation(&raw.lfq_intensities);
+
+    assert!(
+        norm_cv < raw_cv,
+        "normalized CV ({norm_cv}) should be < raw CV ({raw_cv})"
+    );
+
+    // Metadata should be identical
+    assert_eq!(normalized.peptide_count, raw.peptide_count);
+    assert_eq!(normalized.sample_coverage, raw.sample_coverage);
+}
+
+#[test]
+fn explicit_reference_sample_is_honored() {
+    let run_count = 3;
+    let db = fake_database(vec![
+        fake_peptide("PEP_A", &["P12345"], false),
+        fake_peptide("PEP_B", &["P12345"], false),
+    ]);
+
+    let traces = vec![
+        fake_trace(0, false, 0.005, &[100.0, 200.0, 300.0]),
+        fake_trace(1, false, 0.006, &[150.0, 250.0, 350.0]),
+    ];
+
+    let max_precursor_q = 0.01;
+    let groups = ProteinQuantTrace::group_by_accession(&db, &traces, run_count, max_precursor_q);
+
+    let result = quantify_protein_groups(
+        &traces,
+        &groups,
+        max_precursor_q,
+        MaxLfqConfig {
+            min_peptides_per_ratio: 2,
+            min_samples_for_protein: 1,
+            use_global_normalization: true,
+            reference_sample: Some(2),
+        },
+    )
+    .expect("rollup with reference");
+
+    assert_eq!(result.len(), 1);
+    let intensities = &result[0].quant.lfq_intensities;
+    let max_intensity = intensities
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
+    const TOLERANCE: f32 = 0.01;
+    assert!(
+        (intensities[2] - max_intensity).abs() <= TOLERANCE * max_intensity,
+        "reference sample should be within {}% of maximum after normalization",
+        TOLERANCE * 100.0
+    );
+}
+
+#[test]
+fn invalid_reference_sample_returns_error() {
+    let run_count = 2;
+    let db = fake_database(vec![
+        fake_peptide("PEP_A", &["P12345"], false),
+        fake_peptide("PEP_B", &["P12345"], false),
+    ]);
+
+    let traces = vec![
+        fake_trace(0, false, 0.005, &[100.0, 200.0]),
+        fake_trace(1, false, 0.006, &[150.0, 250.0]),
+    ];
+
+    let max_precursor_q = 0.01;
+    let groups = ProteinQuantTrace::group_by_accession(&db, &traces, run_count, max_precursor_q);
+
+    let result = quantify_protein_groups(
+        &traces,
+        &groups,
+        max_precursor_q,
+        MaxLfqConfig {
+            min_peptides_per_ratio: 2,
+            min_samples_for_protein: 1,
+            use_global_normalization: true,
+            reference_sample: Some(5),
+        },
+    );
+
+    assert!(result.is_err(), "should fail with invalid reference");
+    assert!(matches!(
+        result.unwrap_err(),
+        MaxLfqError::InvalidReferenceSample(5)
+    ));
+}
+
+/// Computes the coefficient of variation (CV) for a set of values.
+///
+/// Returns the ratio of standard deviation to mean using the sample variance
+/// (dividing by _n - 1_) for stability with small cohorts. Returns `0.0` for
+/// empty slices, singletons, or when the mean is zero.
+fn coefficient_of_variation(values: &[f32]) -> f64 {
+    if values.len() < 2 {
+        return 0.0;
+    }
+
+    let n = values.len() as f64;
+    let mean: f64 = values.iter().map(|&v| v as f64).sum::<f64>() / n;
+
+    if mean == 0.0 {
+        return 0.0;
+    }
+
+    let variance: f64 = values
+        .iter()
+        .map(|&v| (v as f64 - mean).powi(2))
+        .sum::<f64>()
+        / (n - 1.0);
+
+    variance.sqrt() / mean
 }
