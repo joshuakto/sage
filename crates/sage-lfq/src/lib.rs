@@ -1,4 +1,4 @@
-mod delayed_normalization;
+pub mod delayed_normalization;
 pub mod error;
 pub mod matrix;
 pub mod solver;

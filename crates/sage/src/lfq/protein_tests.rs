@@ -988,41 +988,112 @@ fn explicit_reference_sample_is_honored() {
     let db = fake_database(vec![
         fake_peptide("PEP_A", &["P12345"], false),
         fake_peptide("PEP_B", &["P12345"], false),
+        fake_peptide("PEP_C", &["P12345"], false),
     ]);
 
     let traces = vec![
-        fake_trace(0, false, 0.005, &[100.0, 200.0, 300.0]),
-        fake_trace(1, false, 0.006, &[150.0, 250.0, 350.0]),
+        fake_trace(0, false, 0.005, &[100.0, 200.0, 400.0]),
+        fake_trace(1, false, 0.006, &[150.0, 300.0, 600.0]),
+        fake_trace(2, false, 0.007, &[120.0, 240.0, 480.0]),
     ];
 
     let max_precursor_q = 0.01;
     let groups = ProteinQuantTrace::group_by_accession(&db, &traces, run_count, max_precursor_q);
 
-    let result = quantify_protein_groups(
+    let config_with_reference = MaxLfqConfig {
+        min_peptides_per_ratio: 2,
+        min_samples_for_protein: 1,
+        use_global_normalization: true,
+        reference_sample: Some(2),
+    };
+
+    let result_with_reference = quantify_protein_groups(
         &traces,
         &groups,
         max_precursor_q,
-        MaxLfqConfig {
-            min_peptides_per_ratio: 2,
-            min_samples_for_protein: 1,
-            use_global_normalization: true,
-            reference_sample: Some(2),
-        },
+        config_with_reference.clone(),
     )
-    .expect("rollup with reference");
+    .expect("rollup with explicit reference should succeed");
 
-    assert_eq!(result.len(), 1);
-    let intensities = &result[0].quant.lfq_intensities;
-    let max_intensity = intensities
-        .iter()
-        .copied()
-        .fold(f32::NEG_INFINITY, f32::max);
-    const TOLERANCE: f32 = 0.01;
+    assert_eq!(result_with_reference.len(), 1);
+    let intensities_with_reference = &result_with_reference[0].quant.lfq_intensities;
+    assert_eq!(intensities_with_reference.len(), run_count);
+
+    // Compute the normalization offsets directly to verify the reference anchor.
+    let intensity_matrix = sage_lfq::IntensityMatrix::from_peptide_traces(&traces, run_count);
+    let offsets = sage_lfq::delayed_normalization::compute_delayed_normalization(
+        &intensity_matrix,
+        config_with_reference.reference_sample,
+    )
+    .expect("normalization should succeed with explicit reference");
+
+    assert_eq!(offsets.len(), run_count);
     assert!(
-        (intensities[2] - max_intensity).abs() <= TOLERANCE * max_intensity,
-        "reference sample should be within {}% of maximum after normalization",
-        TOLERANCE * 100.0
+        offsets[2].abs() < 1e-9,
+        "reference sample must have zero offset"
     );
+    assert!(
+        offsets
+            .iter()
+            .enumerate()
+            .any(|(idx, offset)| idx != 2 && offset.abs() > 1e-3),
+        "non-reference samples should receive non-zero offsets in this scenario"
+    );
+
+    // Manually apply the computed offsets (multiply by 2^-offset because normalization
+    // operates in log2 space) and confirm the solver receives equivalent inputs when
+    // global normalization is disabled.
+    let scales: Vec<f64> = offsets.iter().map(|offset| 2f64.powf(-offset)).collect();
+    let mut manually_normalized = traces.clone();
+    for trace in &mut manually_normalized {
+        for (intensity, scale) in trace.intensities.iter_mut().zip(&scales) {
+            if *intensity > 0.0 {
+                *intensity *= scale;
+            }
+        }
+    }
+
+    let mut manual_config = config_with_reference.clone();
+    manual_config.use_global_normalization = false;
+    manual_config.reference_sample = None;
+
+    let manual_result = quantify_protein_groups(
+        &manually_normalized,
+        &groups,
+        max_precursor_q,
+        manual_config,
+    )
+    .expect("manual normalization rollup");
+
+    assert_eq!(manual_result.len(), 1);
+    let manual_intensities = &manual_result[0].quant.lfq_intensities;
+    assert_eq!(manual_intensities.len(), run_count);
+
+    let ratios: Vec<f64> = manual_intensities
+        .iter()
+        .zip(intensities_with_reference.iter())
+        .filter_map(|(manual, reference)| {
+            let manual = f64::from(*manual);
+            let reference = f64::from(*reference);
+            if manual > 0.0 && reference > 0.0 {
+                Some(manual / reference)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    assert!(
+        !ratios.is_empty(),
+        "expected positive intensities for ratio check"
+    );
+    let mean_ratio: f64 = ratios.iter().sum::<f64>() / ratios.len() as f64;
+    for ratio in ratios {
+        assert!(
+            (ratio - mean_ratio).abs() <= 1e-6,
+            "normalization scale should differ only by a constant factor"
+        );
+    }
 }
 
 #[test]
