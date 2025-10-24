@@ -239,4 +239,133 @@ mod tests {
         assert_eq!(quant_result.skipped[0].protein_ids, vec!["Protein2"]);
         assert_eq!(quant_result.skipped[0].reason, SkipReason::DisconnectedGraph);
     }
+
+    #[test]
+    fn insufficient_peptides_are_skipped_with_reason() {
+        // 3 samples, 3 proteins with varying peptide counts
+        let traces = vec![
+            // Protein 1: 1 peptide (insufficient)
+            MockTrace {
+                intensities: vec![10.0, 11.0, 12.0],
+                peptide_idx: 0,
+            },
+            // Protein 2: 2 peptides (sufficient)
+            MockTrace {
+                intensities: vec![20.0, 21.0, 22.0],
+                peptide_idx: 1,
+            },
+            MockTrace {
+                intensities: vec![30.0, 31.0, 32.0],
+                peptide_idx: 2,
+            },
+            // Protein 3: 3 peptides (sufficient)
+            MockTrace {
+                intensities: vec![40.0, 41.0, 42.0],
+                peptide_idx: 3,
+            },
+            MockTrace {
+                intensities: vec![50.0, 51.0, 52.0],
+                peptide_idx: 4,
+            },
+            MockTrace {
+                intensities: vec![60.0, 61.0, 62.0],
+                peptide_idx: 5,
+            },
+        ];
+
+        let protein_groups = vec![
+            (vec!["SinglePeptide".to_string()], vec![0]),
+            (vec!["TwoPeptides".to_string()], vec![1, 2]),
+            (vec!["ThreePeptides".to_string()], vec![3, 4, 5]),
+        ];
+
+        let config = MaxLfqConfig {
+            min_peptides_per_ratio: 2,
+            ..Default::default()
+        };
+
+        let result = quantify_proteins(&traces, &protein_groups, config).unwrap();
+
+        // Verify quantified proteins
+        assert_eq!(result.quantified.len(), 2);
+        assert_eq!(result.quantified[0].protein_ids, vec!["TwoPeptides"]);
+        assert_eq!(result.quantified[0].peptide_count, 2);
+        assert_eq!(result.quantified[0].sample_coverage, vec![true, true, true]);
+        assert_eq!(result.quantified[1].protein_ids, vec!["ThreePeptides"]);
+        assert_eq!(result.quantified[1].peptide_count, 3);
+        assert_eq!(result.quantified[1].sample_coverage, vec![true, true, true]);
+
+        // Verify skipped protein with correct reason
+        assert_eq!(result.skipped.len(), 1);
+        assert_eq!(result.skipped[0].protein_ids, vec!["SinglePeptide"]);
+        assert_eq!(result.skipped[0].reason, SkipReason::InsufficientPeptides);
+    }
+
+    #[test]
+    fn multiple_skip_reasons_reported_independently() {
+        let traces = vec![
+            // Protein 1: Sufficient peptides, fully connected
+            MockTrace {
+                intensities: vec![10.0, 11.0, 12.0, 13.0],
+                peptide_idx: 0,
+            },
+            MockTrace {
+                intensities: vec![20.0, 21.0, 22.0, 23.0],
+                peptide_idx: 1,
+            },
+            // Protein 2: Disconnected (samples 0-1 vs 2-3)
+            MockTrace {
+                intensities: vec![30.0, 31.0, f64::NAN, f64::NAN],
+                peptide_idx: 2,
+            },
+            MockTrace {
+                intensities: vec![f64::NAN, f64::NAN, 32.0, 33.0],
+                peptide_idx: 3,
+            },
+            // Protein 3: Insufficient peptides
+            MockTrace {
+                intensities: vec![40.0, 41.0, 42.0, 43.0],
+                peptide_idx: 4,
+            },
+        ];
+
+        let protein_groups = vec![
+            (vec!["Connected".to_string()], vec![0, 1]),
+            (vec!["Disconnected".to_string()], vec![2, 3]),
+            (vec!["SinglePep".to_string()], vec![4]),
+        ];
+
+        let config = MaxLfqConfig {
+            min_peptides_per_ratio: 2,
+            ..Default::default()
+        };
+
+        let result = quantify_proteins(&traces, &protein_groups, config).unwrap();
+
+        // One quantified
+        assert_eq!(result.quantified.len(), 1);
+        assert_eq!(result.quantified[0].protein_ids, vec!["Connected"]);
+        assert_eq!(result.quantified[0].peptide_count, 2);
+        assert_eq!(
+            result.quantified[0].sample_coverage,
+            vec![true, true, true, true]
+        );
+
+        // Two skipped with different reasons
+        assert_eq!(result.skipped.len(), 2);
+
+        let disconnected = result
+            .skipped
+            .iter()
+            .find(|s| s.protein_ids == vec!["Disconnected"])
+            .expect("missing disconnected protein");
+        assert_eq!(disconnected.reason, SkipReason::DisconnectedGraph);
+
+        let insufficient = result
+            .skipped
+            .iter()
+            .find(|s| s.protein_ids == vec!["SinglePep"])
+            .expect("missing insufficient protein");
+        assert_eq!(insufficient.reason, SkipReason::InsufficientPeptides);
+    }
 }
