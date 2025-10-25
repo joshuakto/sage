@@ -13,6 +13,8 @@ use tempfile::TempDir;
 
 #[derive(Debug, Deserialize)]
 struct GoldenObservation {
+    run_name: String,
+    #[allow(dead_code)]
     scannr: u32,
     charge: i32,
     #[allow(dead_code)]
@@ -630,22 +632,20 @@ fn lfq_outputs_match_golden() -> Result<()> {
             "LFQ TSV contained non-zero intensities without matching golden data"
         );
     } else {
-        let mut unique_scans: Vec<u32> =
-            golden_data.observations.iter().map(|g| g.scannr).collect();
-        unique_scans.sort_unstable();
-        unique_scans.dedup();
-
-        let scan_to_index: HashMap<u32, usize> = unique_scans
+        let run_lookup: HashMap<&str, usize> = lfq
+            .run_names
             .iter()
             .enumerate()
-            .map(|(idx, scan)| (*scan, idx))
+            .map(|(idx, name)| (name.as_str(), idx))
             .collect();
 
         let mut expected_intensity: HashMap<(usize, i32), f64> = HashMap::new();
         let mut expected_presence: HashSet<(usize, i32)> = HashSet::new();
 
         for entry in &golden_data.observations {
-            let run_idx = scan_to_index[&entry.scannr];
+            let run_idx = *run_lookup
+                .get(entry.run_name.as_str())
+                .ok_or_else(|| anyhow!("unknown run '{}' in golden data", entry.run_name))?;
             *expected_intensity
                 .entry((run_idx, entry.charge))
                 .or_insert(0.0) += entry.intensity;
