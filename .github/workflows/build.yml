@@ -3,6 +3,12 @@ name: Build Sage Executables
 on:
   release:
     types: [created]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (e.g., v0.15.0-beta.2)'
+        required: true
+        type: string
 
 jobs:
   build_ubuntu:
@@ -33,7 +39,7 @@ jobs:
       - name: Build archive
         shell: bash
         run: |
-          sage_version=${{ github.ref_name }}
+          sage_version=${{ github.event.inputs.version || github.ref_name }}
           staging="sage-$sage_version-${{ matrix.target }}"
           mkdir -p "$staging"
           cp {README.md,LICENSE} "$staging/"
@@ -76,7 +82,7 @@ jobs:
       - name: Build archive
         shell: bash
         run: |
-          sage_version=${{ github.ref_name }} 
+          sage_version=${{ github.event.inputs.version || github.ref_name }}
           staging="sage-$sage_version-${{ matrix.target }}"
           mkdir -p "$staging"
           cp {README.md,DOCS.md,LICENSE} "$staging/"
@@ -122,7 +128,7 @@ jobs:
       - name: Build archive
         shell: bash
         run: |
-          sage_version=${{ github.ref_name }} 
+          sage_version=${{ github.event.inputs.version || github.ref_name }}
           staging="sage-$sage_version-${{ matrix.target }}"
           mkdir -p "$staging"
           cp {README.md,LICENSE} "$staging/"
