@@ -5,6 +5,7 @@
   ],
   "observations": [
     {
+      "run_name": "lfq_run1.mzML",
       "scannr": 1,
       "charge": 3,
       "mass": 642.0266,
@@ -13,6 +14,7 @@
       "rt": 0.51
     },
     {
+      "run_name": "lfq_run2.mzML",
       "scannr": 2,
       "charge": 3,
       "mass": 642.0266,
