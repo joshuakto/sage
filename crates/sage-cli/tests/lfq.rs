@@ -151,10 +151,14 @@ fn read_lfq_parquet(
             .with_context(|| format!("missing filename column in {}", parquet_path.display()))?
             .to_string();
 
-        let charge = match row.get_int(2) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
+        let charge = row
+            .get_int(2)
+            .with_context(|| {
+                format!(
+                    "invalid charge column in parquet row (file: {})",
+                    parquet_path.display()
+                )
+            })?;
 
         let intensity = row
             .get_double(7)
