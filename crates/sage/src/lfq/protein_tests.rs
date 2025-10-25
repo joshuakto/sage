@@ -1134,12 +1134,14 @@ fn invalid_reference_sample_returns_error() {
 /// Computes the coefficient of variation (CV) for a set of values.
 ///
 /// Returns the ratio of standard deviation to mean using the sample variance
-/// (dividing by _n - 1_) for stability with small cohorts. Returns `0.0` for
-/// empty slices, singletons, or when the mean is zero.
+/// (dividing by _n - 1_) for stability with small cohorts. Panics if fewer than
+/// two values are provided to surface misuse in tests and avoid silently
+/// returning misleading numbers. Returns `0.0` when the mean is zero.
 fn coefficient_of_variation(values: &[f32]) -> f64 {
-    if values.len() < 2 {
-        return 0.0;
-    }
+    assert!(
+        values.len() >= 2,
+        "coefficient_of_variation requires at least two values"
+    );
 
     let n = values.len() as f64;
     let mean: f64 = values.iter().map(|&v| v as f64).sum::<f64>() / n;
