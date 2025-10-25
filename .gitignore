@@ -7,6 +7,7 @@ data/
 *.tsv
 *.gz
 *.json
+!tests/*.json
 *.ms2
 *.fasta
 *.fas
