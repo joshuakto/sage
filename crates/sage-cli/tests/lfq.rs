@@ -7,7 +7,7 @@ use anyhow::{anyhow, Context, Result};
 use assert_cmd::prelude::*;
 use csv::ReaderBuilder;
 use parquet::file::reader::{FileReader, SerializedFileReader};
-use parquet::record::RowAccessor;
+use parquet::record::{Field, RowAccessor};
 use serde::Deserialize;
 use tempfile::TempDir;
 
@@ -143,6 +143,8 @@ fn read_lfq_parquet(
 
     let mut intensities: HashMap<(usize, i32), f64> = HashMap::new();
 
+    const COMBINED_CHARGE_SENTINEL: i32 = -1;
+
     while let Some(row) = rows.next() {
         let row = row.with_context(|| {
             format!("failed to read parquet row from {}", parquet_path.display())
@@ -153,9 +155,24 @@ fn read_lfq_parquet(
             .with_context(|| format!("missing filename column in {}", parquet_path.display()))?
             .to_string();
 
-        let charge = match row.get_int(2) {
-            Ok(value) => value,
-            Err(_) => continue,
+        let mut columns = row.get_column_iter();
+        let charge = columns
+            .nth(2)
+            .ok_or_else(|| anyhow!(
+                "missing charge column in parquet row (file: {})",
+                parquet_path.display()
+            ))?
+            .1;
+        let charge = match charge {
+            Field::Int(value) => *value,
+            Field::Null => COMBINED_CHARGE_SENTINEL,
+            other => {
+                return Err(anyhow!(
+                    "invalid charge column in parquet row (file: {}): {}",
+                    parquet_path.display(),
+                    other
+                ))
+            }
         };
 
         let intensity = row
