@@ -1,0 +1,11 @@
+{
+  "run_names": ["lfq_run1.mzML", "lfq_run2.mzML"],
+  "proteins": [
+    {
+      "accessions": ["sp|Q99536|VAT1_HUMAN"],
+      "min_q_value": 0.0,
+      "has_intensities": true,
+      "min_coverage_count": 2
+    }
+  ]
+}
