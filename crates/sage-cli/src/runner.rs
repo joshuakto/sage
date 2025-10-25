@@ -152,7 +152,7 @@ impl Runner {
                 false => None,
             };
 
-        let db_params = self.parameters.database.clone();
+        let mut db_params = self.parameters.database.clone();
         // TODO: Don't generate decoys for fast searching
         // * if `generate_decoys` is used, we should re-generate at the end
         //  to ensure that picked-peptide conditions are used, otherwise,
