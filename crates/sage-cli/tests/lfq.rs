@@ -796,6 +796,18 @@ fn lfq_outputs_match_golden() -> Result<()> {
         );
     }
 
+    // Verify parquet doesn't have unexpected entries or mismatched zeros
+    for (key, parquet_intensity) in &parquet_map {
+        let tsv_intensity = lfq.intensities.get(key).copied().unwrap_or_default();
+        assert!(
+            approx_equal(tsv_intensity, *parquet_intensity),
+            "parquet has entry {:?} not matching TSV: parquet={}, tsv={}",
+            key,
+            parquet_intensity,
+            tsv_intensity
+        );
+    }
+
     let proteins_parquet = parquet_dir.join("lfq_proteins.parquet");
     assert!(
         proteins_parquet.exists(),
