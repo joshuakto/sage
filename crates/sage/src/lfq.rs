@@ -1,12 +1,51 @@
+//! Label-free quantification (LFQ) for proteomics data using the MaxLFQ algorithm.
+//!
+//! Protein-level aggregation relies on deterministic data structures so repeated analyses
+//! produce bytewise-identical outputs that downstream reporting and regulatory pipelines can
+//! reproduce.
+//!
+//! # Terminology Note: Proteomics vs. Genomics
+//!
+//! This module uses **proteomics-standard terminology** which differs from genomics conventions:
+//!
+//! ## Proteomics Definitions (used here):
+//!
+//! - **Peptide**: An amino acid sequence (e.g., "PEPTIDE")
+//! - **Precursor Ion**: A peptide + charge state + modifications (e.g., PEPTIDE[+2])
+//! - **Unique Peptide**: A peptide sequence mapping to only one protein
+//! - **Shared/Razor Peptide**: A peptide sequence mapping to multiple proteins
+//!
+//! ## Genomics Definitions (NOT used here):
+//!
+//! - **Unique**: Sequences mapping to only one genomic location (mappability)
+//! - **Multi-mapping**: Sequences mapping to multiple genomic locations
+//!
+//! In proteomics, a "unique peptide" refers to protein specificity, not genomic mappability.
+//! For example, a peptide that appears in multiple genomic loci (paralogous genes) may still
+//! be considered "unique" in proteomics if it distinguishes a single protein isoform.
+//!
+//! # Counting Conventions:
+//!
+//! - `total_precursors`: Counts all detected precursor ions (each charge state separately)
+//! - `unique_peptides`: Counts distinct peptide sequences (charge states collapsed)
+//! - `lfq_peptide_count`: MaxLFQ-specific count used in quantification (may include razor peptides)
+
 use crate::database::{binary_search_slice, IndexedDatabase, PeptideIx};
 use crate::mass::{composition, Composition, Tolerance, NEUTRON};
 use crate::ml::{matrix::Matrix, retention_alignment::Alignment};
 use crate::scoring::Feature;
 use crate::spectrum::MS1Spectra;
 use dashmap::DashMap;
+use fnv::FnvHashMap;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
+
+pub use sage_lfq::{
+    MaxLfqConfig, MaxLfqError, ProteinQuantResult, QuantificationResult, SkipReason,
+    SkippedProtein,
+};
 
 /// Minimum normalized spectral angle required to integrate a peak
 // const MIN_SPECTRAL_ANGLE: f64 = 0.70;
@@ -36,7 +75,504 @@ pub enum IntegrationStrategy {
     Sum,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug)]
+pub struct PeptideQuantTrace {
+    pub precursor: PrecursorId,
+    pub peptide: PeptideIx,
+    pub decoy: bool,
+    pub peak: Peak,
+    pub intensities: Vec<f64>,
+    pub reference_file_id: usize,
+    pub dot_product: Matrix,
+    pub spectral_angle: Matrix,
+    pub isotope_traces: Matrix,
+    pub raw_isotope_traces: Matrix,
+    pub isotopic_distribution: [f32; N_ISOTOPES],
+    pub time_warps: Vec<isize>,
+}
+
+impl sage_lfq::QuantTrace for PeptideQuantTrace {
+    fn intensities(&self) -> &[f64] {
+        &self.intensities
+    }
+
+    fn peptide_index(&self) -> usize {
+        self.peptide.0 as usize
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ProteinQuantTrace {
+    pub accessions: Vec<Arc<str>>,
+    pub decoy: bool,
+    pub intensities: Vec<f64>,
+    pub q_value: f32,
+    /// Total number of precursor ions (distinct combinations of peptide sequence,
+    /// charge state, and modifications) identified for this protein, regardless
+    /// of q-value threshold.
+    ///
+    /// This corresponds to the proteomics concept of "peptide species" as defined
+    /// in the MaxLFQ algorithm. Each charge state (+2, +3, etc.) of the same
+    /// peptide sequence counts as a separate precursor.
+    ///
+    /// Example: The peptide PEPTIDE detected as [M+2H]²⁺ and [M+3H]³⁺ contributes
+    /// 2 to `total_precursors` but represents only 1 unique peptide sequence.
+    pub total_precursors: usize,
+    /// Number of unique peptide sequences (stripped of charge/modification state)
+    /// that passed the q-value threshold for this protein.
+    ///
+    /// **Proteomics-specific terminology**: In proteomics, "unique peptides" refers
+    /// to peptide sequences that map to a single protein (as opposed to "shared" or
+    /// "razor" peptides that map to multiple proteins). This differs from genomics
+    /// terminology where "unique" typically refers to mappability (sequences mapping
+    /// to one genomic location).
+    ///
+    /// Note: This metric counts distinct amino acid sequences only. The peptide
+    /// PEPTIDE with charge states +2 and +3 contributes only 1 to `unique_peptides`,
+    /// even though it represents 2 precursor ions in `total_precursors`.
+    ///
+    /// This field includes only peptides passing the FDR threshold (`max_precursor_q`),
+    /// enabling quality-controlled assessment of protein identification confidence.
+    pub unique_peptides: usize,
+    pub peptide_indices: Vec<PeptideIx>,
+    pub run_coverage: Vec<usize>,
+}
+
+/// Enhanced protein quantification result combining MaxLFQ intensities with protein metadata.
+///
+/// This structure preserves important protein grouping information alongside the quantification
+/// results, enabling comprehensive quality control and downstream filtering based on FDR,
+/// peptide counts, and sample coverage.
+#[derive(Clone, Debug)]
+pub struct ProteinRollupResult {
+    /// Protein accessions (sorted and deduplicated)
+    pub accessions: Vec<Arc<str>>,
+    /// MaxLFQ quantification results
+    pub quant: ProteinQuantResult,
+    /// Protein-level q-value (minimum across constituent peptides)
+    pub q_value: f32,
+    /// Total number of precursor ions (distinct combinations of peptide sequence,
+    /// charge state, and modifications) identified for this protein, regardless
+    /// of q-value threshold.
+    ///
+    /// This corresponds to the proteomics concept of "peptide species" as defined
+    /// in the MaxLFQ algorithm. Each charge state (+2, +3, etc.) of the same
+    /// peptide sequence counts as a separate precursor.
+    ///
+    /// Example: The peptide PEPTIDE detected as [M+2H]²⁺ and [M+3H]³⁺ contributes
+    /// 2 to `total_precursors` but represents only 1 unique peptide sequence.
+    pub total_precursors: usize,
+    /// Number of unique peptide sequences (stripped of charge/modification state)
+    /// that passed the q-value threshold for this protein.
+    ///
+    /// **Proteomics-specific terminology**: In proteomics, "unique peptides" refers
+    /// to peptide sequences that map to a single protein (as opposed to "shared" or
+    /// "razor" peptides that map to multiple proteins). This differs from genomics
+    /// terminology where "unique" typically refers to mappability (sequences mapping
+    /// to one genomic location).
+    ///
+    /// Note: This metric counts distinct amino acid sequences only. The peptide
+    /// PEPTIDE with charge states +2 and +3 contributes only 1 to `unique_peptides`,
+    /// even though it represents 2 precursor ions in `total_precursors`.
+    ///
+    /// This field includes only peptides passing the FDR threshold (`max_precursor_q`),
+    /// enabling quality-controlled assessment of protein identification confidence.
+    pub unique_peptides: usize,
+    /// Number of contributing peptides per run (for batch effect diagnosis)
+    pub run_coverage: Vec<usize>,
+}
+
+fn canonicalize_accessions(accessions: &mut Vec<Arc<str>>) {
+    accessions.sort_unstable_by(|a, b| a.as_ref().cmp(b.as_ref()));
+    accessions.dedup_by(|a, b| a.as_ref() == b.as_ref());
+}
+
+struct ProteinGroupAccumulator {
+    trace: ProteinQuantTrace,
+    peptides: HashSet<PeptideIx>,
+    run_contributors: Vec<HashSet<PeptideIx>>,
+}
+
+impl ProteinGroupAccumulator {
+    fn new(mut accessions: Vec<Arc<str>>, run_count: usize) -> Self {
+        canonicalize_accessions(&mut accessions);
+        Self {
+            trace: ProteinQuantTrace {
+                accessions,
+                decoy: false,
+                intensities: vec![0.0; run_count],
+                q_value: f32::INFINITY,
+                total_precursors: 0,
+                unique_peptides: 0,
+                peptide_indices: Vec::new(),
+                run_coverage: vec![0; run_count],
+            },
+            peptides: HashSet::new(),
+            run_contributors: (0..run_count).map(|_| HashSet::new()).collect(),
+        }
+    }
+
+    fn ingest_trace(
+        &mut self,
+        trace: &PeptideQuantTrace,
+        peptide_decoy: bool,
+        max_precursor_q: f32,
+        run_count: usize,
+    ) {
+        self.trace.total_precursors += 1;
+        self.trace.q_value = self.trace.q_value.min(trace.peak.q_value);
+        self.trace.decoy |= peptide_decoy;
+
+        if trace.peak.q_value <= max_precursor_q {
+            let is_new_peptide = self.peptides.insert(trace.peptide);
+            if is_new_peptide {
+                self.trace.unique_peptides += 1;
+            }
+            for (run_idx, intensity) in trace
+                .intensities
+                .iter()
+                .copied()
+                .take(run_count)
+                .enumerate()
+            {
+                self.trace.intensities[run_idx] += intensity;
+                if intensity > 0.0 && self.run_contributors[run_idx].insert(trace.peptide) {
+                    self.trace.run_coverage[run_idx] += 1;
+                }
+            }
+        }
+    }
+
+    fn finalize(mut self, run_count: usize) -> ProteinQuantTrace {
+        self.trace.peptide_indices = self.peptides.into_iter().collect();
+        self.trace
+            .peptide_indices
+            .sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+        if self.trace.q_value.is_infinite() {
+            self.trace.q_value = 1.0;
+        }
+
+        self.trace.intensities.resize(run_count, 0.0);
+        self.trace.run_coverage.resize(run_count, 0);
+
+        self.trace
+    }
+}
+
+impl ProteinQuantTrace {
+    /// Aggregate peptide level quantification traces by their parent protein accession set.
+    ///
+    /// Accessions are canonicalized (sorted and deduplicated) before they become keys inside the
+    /// aggregation [`BTreeMap`]. This guarantees deterministic ordering for every consumer of the
+    /// resulting protein groups, irrespective of the order in which peptides were processed. The
+    /// aggregation prefers iterator-based rollups so we do not rely on manual index bookkeeping
+    /// for intensity vectors that may be shorter than the expected run count. During accumulation
+    /// we delay deduplication of peptide membership until the end so we only sort once per protein
+    /// group, which keeps cloning of shared [`Arc<str>`] accessions to a minimum while still
+    /// producing reproducible output.
+    pub fn group_by_accession(
+        db: &IndexedDatabase,
+        traces: &[PeptideQuantTrace],
+        run_count: usize,
+        max_precursor_q: f32,
+    ) -> BTreeMap<Vec<Arc<str>>, ProteinQuantTrace> {
+        // Track peptide indices in a `HashSet` while aggregating so we can guarantee
+        // deduplicated, sorted peptide membership lists once at the end of processing.
+        let mut proteins: BTreeMap<Vec<Arc<str>>, ProteinGroupAccumulator> = BTreeMap::new();
+
+        for trace in traces {
+            let peptide = &db.peptides[trace.peptide.0 as usize];
+            // Clone and canonicalize the accession list once per peptide. The canonical ordering
+            // serves both as the deterministic BTreeMap key and the final accession list stored in
+            // the trace, so we only ever sort/deduplicate once per peptide.
+            let mut accessions: Vec<Arc<str>> = match (peptide.decoy, trace.decoy) {
+                (true, _) => {
+                    // FASTA-supplied decoys retain their recorded accession strings. When the
+                    // FASTA already includes the decoy prefix we keep it as-is; otherwise we add
+                    // the tag so picked-decoy databases and user-provided decoys share the same
+                    // namespace.
+                    let decoy_tag = db.decoy_tag.as_str();
+                    peptide
+                        .proteins
+                        .iter()
+                        .map(|acc| {
+                            if acc.starts_with(decoy_tag) {
+                                acc.clone()
+                            } else {
+                                Arc::<str>::from(format!("{}{}", decoy_tag, acc.as_ref()))
+                            }
+                        })
+                        .collect()
+                }
+                (false, true) => {
+                    // Synthetic trace-level decoys derived from target peptides reuse the
+                    // accession list but occupy a dedicated namespace so they do not merge with
+                    // FASTA-provided decoys that may already carry the same decoy-tagged
+                    // identifier.
+                    let decoy_tag = db.decoy_tag.as_str();
+                    peptide
+                        .proteins
+                        .iter()
+                        .map(|acc| Arc::<str>::from(format!("{}{}#TRACE", decoy_tag, acc.as_ref())))
+                        .collect()
+                }
+                (false, false) => peptide.proteins.clone(),
+            };
+            canonicalize_accessions(&mut accessions);
+
+            proteins
+                .entry(accessions.clone())
+                .or_insert_with(|| ProteinGroupAccumulator::new(accessions.clone(), run_count))
+                .ingest_trace(
+                    trace,
+                    peptide.decoy || trace.decoy,
+                    max_precursor_q,
+                    run_count,
+                );
+        }
+
+        let mut finalized = BTreeMap::new();
+
+        for (accessions, accumulator) in proteins {
+            finalized.insert(accessions, accumulator.finalize(run_count));
+        }
+
+        finalized
+    }
+
+    /// Deterministically iterate over aggregated protein groups in ascending accession order.
+    pub fn ordered_groups<'a>(
+        proteins: &'a BTreeMap<Vec<Arc<str>>, ProteinQuantTrace>,
+    ) -> impl Iterator<Item = (&'a [Arc<str>], &'a ProteinQuantTrace)> + 'a {
+        proteins
+            .iter()
+            .map(|(accessions, trace)| (accessions.as_slice(), trace))
+    }
+
+    /// Deterministically iterate over the protein quantification traces only, preserving the
+    /// ascending order imposed by [`ordered_groups`].
+    pub fn ordered_values<'a>(
+        proteins: &'a BTreeMap<Vec<Arc<str>>, ProteinQuantTrace>,
+    ) -> impl Iterator<Item = &'a ProteinQuantTrace> + 'a {
+        proteins.values()
+    }
+}
+
+fn build_solver_groups(
+    index_lookup: &FnvHashMap<PeptideIx, Vec<usize>>,
+    proteins: &BTreeMap<Vec<Arc<str>>, ProteinQuantTrace>,
+    config: &MaxLfqConfig,
+) -> Vec<(Vec<String>, Vec<usize>)> {
+    ProteinQuantTrace::ordered_groups(proteins)
+        .filter_map(|(accessions, trace)| {
+            if trace.decoy {
+                return None;
+            }
+
+            let mut peptide_rows: Vec<usize> = Vec::new();
+            let mut observed_peptides = 0usize;
+
+            for ix in &trace.peptide_indices {
+                if let Some(rows) = index_lookup.get(ix) {
+                    observed_peptides += 1;
+                    peptide_rows.extend(rows.iter().copied());
+                }
+            }
+
+            if peptide_rows.is_empty() {
+                return None;
+            }
+
+            // Filter proteins that don't meet minimum peptide threshold
+            // These will be silently skipped by the MaxLFQ solver if they reach it
+            if observed_peptides < config.min_peptides_per_ratio {
+                return None;
+            }
+
+            peptide_rows.sort_unstable();
+
+            let accession_strings = accessions
+                .iter()
+                .map(|acc| acc.as_ref().to_string())
+                .collect::<Vec<_>>();
+
+            Some((accession_strings, peptide_rows))
+        })
+        .collect()
+}
+
+/// Check if a peptide quantification trace passes the FDR threshold for protein quantification.
+///
+/// Traces are excluded if they are decoys or if their precursor q-value exceeds the threshold.
+#[inline]
+fn passes_fdr_filter(trace: &PeptideQuantTrace, max_precursor_q: f32) -> bool {
+    !trace.decoy && trace.peak.q_value <= max_precursor_q
+}
+
+/// Convert protein-level quantification traces into MaxLFQ protein roll-up results.
+///
+/// The helper prepares the deterministic `(Vec<String>, Vec<usize>)` tuples required
+/// by [`sage_lfq::quantify_proteins`] by resolving each peptide identifier to the
+/// corresponding position inside the provided [`PeptideQuantTrace`] slice. Protein
+/// groups flagged as decoys or without any matched peptides are ignored so the
+/// downstream solver only evaluates target proteins with usable evidence.
+///
+/// Proteins with fewer peptides than `config.min_peptides_per_ratio` are filtered
+/// out before quantification to prevent errors in the MaxLFQ solver. Only traces
+/// whose precursor q-value is at or below `max_precursor_q` contribute to the
+/// MaxLFQ system so high-q evidence cannot bypass FDR filtering during roll-up.
+///
+/// Returns [`ProteinRollupResult`] which combines MaxLFQ intensities with protein
+/// metadata (q-value, peptide counts, run coverage) for comprehensive quality control.
+pub fn quantify_protein_groups(
+    traces: &[PeptideQuantTrace],
+    proteins: &BTreeMap<Vec<Arc<str>>, ProteinQuantTrace>,
+    max_precursor_q: f32,
+    config: MaxLfqConfig,
+) -> Result<Vec<ProteinRollupResult>, MaxLfqError> {
+    // Validate q-value threshold is in valid range
+    if !(0.0..=1.0).contains(&max_precursor_q) {
+        return Err(MaxLfqError::InvalidParameter(format!(
+            "max_precursor_q must be in [0.0, 1.0], got {}",
+            max_precursor_q
+        )));
+    }
+
+    let mut index_lookup: FnvHashMap<PeptideIx, Vec<usize>> = FnvHashMap::default();
+
+    for (row, trace) in traces.iter().enumerate() {
+        if !passes_fdr_filter(trace, max_precursor_q) {
+            continue;
+        }
+
+        index_lookup.entry(trace.peptide).or_default().push(row);
+    }
+
+    // Debug assertion: verify no high-q traces leaked through
+    #[cfg(debug_assertions)]
+    {
+        for rows in index_lookup.values() {
+            for &row in rows {
+                debug_assert!(
+                    passes_fdr_filter(&traces[row], max_precursor_q),
+                    "High-q trace (q={}) leaked into index_lookup at row {}",
+                    traces[row].peak.q_value,
+                    row
+                );
+            }
+        }
+    }
+
+    // Log how many traces were filtered by q-value threshold
+    let total_target_traces = traces.iter().filter(|t| !t.decoy).count();
+    let passing_traces: usize = index_lookup.values().map(|v| v.len()).sum();
+    let filtered_traces = total_target_traces - passing_traces;
+
+    if filtered_traces > 0 {
+        log::info!(
+            "filtered {} precursor traces (q > {:.3}) before MaxLFQ quantification",
+            filtered_traces,
+            max_precursor_q
+        );
+    }
+
+    if index_lookup.is_empty() {
+        log::warn!(
+            "all {} target traces were filtered by q-value threshold ({:.3}); \
+             consider relaxing max_precursor_q or reviewing upstream FDR control",
+            total_target_traces,
+            max_precursor_q
+        );
+        return Ok(Vec::new());
+    }
+
+    let total_proteins = proteins.len();
+    let groups = build_solver_groups(&index_lookup, proteins, &config);
+    let filtered_count = total_proteins - groups.len();
+
+    if filtered_count > 0 {
+        log::info!(
+            "filtered {} protein groups (decoys or < {} peptides)",
+            filtered_count,
+            config.min_peptides_per_ratio
+        );
+    }
+
+    if groups.is_empty() {
+        log::warn!("no protein groups passed min_peptides filter");
+        return Ok(Vec::new());
+    }
+
+    log::info!("quantifying {} protein groups with MaxLFQ", groups.len());
+
+    // Run MaxLFQ quantification
+    let result = sage_lfq::quantify_proteins(traces, &groups, config)?;
+
+    // Report skipped proteins with explicit reasons
+    if !result.skipped.is_empty() {
+        let skipped_examples: Vec<String> = result
+            .skipped
+            .iter()
+            .take(5)
+            .map(|s| format!("{}({})", s.protein_ids.join(";"), match s.reason {
+                sage_lfq::SkipReason::DisconnectedGraph => "disconnected",
+                sage_lfq::SkipReason::InsufficientPeptides => "insufficient peptides",
+            }))
+            .collect();
+
+        if result.skipped.len() <= 5 {
+            log::warn!(
+                "skipped {} protein groups: {}",
+                result.skipped.len(),
+                skipped_examples.join(", ")
+            );
+        } else {
+            log::warn!(
+                "skipped {} protein groups; examples: {}",
+                result.skipped.len(),
+                skipped_examples.join(", ")
+            );
+        }
+    }
+
+    let quant_results = result.quantified;
+
+    // Zip quantification results with protein metadata
+    // Match by protein IDs to preserve all metadata
+    let mut rollup_results = Vec::with_capacity(quant_results.len());
+    
+    for quant in quant_results {
+        // Convert protein IDs to Arc<str> for lookup
+        let protein_key: Vec<Arc<str>> = quant
+            .protein_ids
+            .iter()
+            .map(|s| Arc::<str>::from(s.as_str()))
+            .collect();
+
+        // Find matching protein trace metadata
+        if let Some(trace) = proteins.get(&protein_key) {
+            rollup_results.push(ProteinRollupResult {
+                accessions: trace.accessions.clone(),
+                quant,
+                q_value: trace.q_value,
+                total_precursors: trace.total_precursors,
+                unique_peptides: trace.unique_peptides,
+                run_coverage: trace.run_coverage.clone(),
+            });
+        } else {
+            // This should never happen - quantified protein must have trace metadata
+            log::warn!(
+                "MaxLFQ quantified protein not found in traces: {:?}",
+                protein_key
+            );
+        }
+    }
+
+    Ok(rollup_results)
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PrecursorId {
     Combined(PeptideIx),
     Charged((PeptideIx, u8)),
@@ -50,6 +586,8 @@ pub struct LfqSettings {
     pub ppm_tolerance: f32,
     pub mobility_pct_tolerance: f32,
     pub combine_charge_states: bool,
+    pub min_peptide_q: f32,
+    pub max_precursor_q: f32,
 }
 
 impl Default for LfqSettings {
@@ -61,6 +599,8 @@ impl Default for LfqSettings {
             ppm_tolerance: 5.0,
             mobility_pct_tolerance: 1.0,
             combine_charge_states: true,
+            min_peptide_q: 0.01,
+            max_precursor_q: 0.05,
         }
     }
 }
@@ -97,7 +637,7 @@ pub fn build_feature_map(
     let map: DashMap<PeptideIx, PrecursorRange, fnv::FnvBuildHasher> = DashMap::default();
     features
         .iter()
-        .filter(|feat| feat.peptide_q <= 0.01 && feat.label == 1)
+        .filter(|feat| feat.peptide_q <= settings.min_peptide_q && feat.label == 1)
         .for_each(|feat| {
             // `features` is sorted by confidence, so just take the first entry
             if !map.contains_key(&feat.peptide_idx) {
@@ -226,7 +766,7 @@ impl FeatureMap {
         db: &IndexedDatabase,
         spectra: &MS1Spectra,
         alignments: &[Alignment],
-    ) -> HashMap<(PrecursorId, bool), (Peak, Vec<f64>), fnv::FnvBuildHasher> {
+    ) -> HashMap<(PrecursorId, bool), PeptideQuantTrace, fnv::FnvBuildHasher> {
         let scores: DashMap<(PrecursorId, bool), Grid, fnv::FnvBuildHasher> = DashMap::default();
 
         log::info!("tracing MS1 features");
@@ -303,14 +843,35 @@ impl FeatureMap {
 
         scores
             .into_par_iter()
-            .filter_map(|(peptide_ix, mut grid)| {
+            .filter_map(|(precursor_key, mut grid)| {
                 // MS1 ions have been added to any relevant grids, so we now
                 // attempt to trace the peaks, find the best peak, and integrate
                 // it across all of the files
-                let mut traces = grid.summarize_traces();
-                let (peak, data) = traces.integrate(&self.settings)?;
+                let traces = grid.summarize_traces();
+                let integrated = traces.integrate(&self.settings)?;
+                let (precursor, decoy) = precursor_key;
+                let peptide = match precursor {
+                    PrecursorId::Combined(ix) => ix,
+                    PrecursorId::Charged((ix, _)) => ix,
+                };
 
-                Some((peptide_ix, (peak, data)))
+                Some((
+                    precursor_key,
+                    PeptideQuantTrace {
+                        precursor,
+                        peptide,
+                        decoy,
+                        peak: integrated.peak,
+                        intensities: integrated.intensities,
+                        reference_file_id: integrated.reference_file_id,
+                        dot_product: integrated.dot_product,
+                        spectral_angle: integrated.spectral_angle,
+                        isotope_traces: integrated.isotope_traces,
+                        raw_isotope_traces: integrated.raw_isotope_traces,
+                        isotopic_distribution: integrated.distribution,
+                        time_warps: integrated.time_warps,
+                    },
+                ))
             })
             .collect::<HashMap<_, _, _>>()
     }
@@ -340,8 +901,27 @@ pub struct Traces {
     pub dot_product: Matrix,
     /// Matrix of spectral angles at each retention time for each file
     pub spectral_angle: Matrix,
+    /// Smoothed per-isotope traces for each file (rows = files * N_ISOTOPES)
+    pub isotope_traces: Matrix,
+    /// Raw per-isotope traces for each file prior to smoothing
+    pub raw_isotope_traces: Matrix,
     /// File with the most confident PSM
     reference_file_id: usize,
+    /// Theoretical isotopic distribution used for normalization
+    distribution: [f32; N_ISOTOPES],
+}
+
+#[derive(Clone, Debug)]
+pub struct IntegratedTraces {
+    pub peak: Peak,
+    pub intensities: Vec<f64>,
+    pub dot_product: Matrix,
+    pub spectral_angle: Matrix,
+    pub isotope_traces: Matrix,
+    pub raw_isotope_traces: Matrix,
+    pub reference_file_id: usize,
+    pub distribution: [f32; N_ISOTOPES],
+    pub time_warps: Vec<isize>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -358,10 +938,12 @@ pub struct Peak {
 
 impl Traces {
     /// Calculate and apply time warping factors
-    fn warp(&mut self) {
+    fn warp(&mut self) -> Vec<isize> {
         let time_warps = self.find_time_warps(&self.dot_product, 75);
         Self::apply_time_warps(&mut self.spectral_angle, &time_warps);
         Self::apply_time_warps(&mut self.dot_product, &time_warps);
+        Self::apply_time_warps_isotopes(&mut self.isotope_traces, &time_warps);
+        time_warps
     }
 
     /// Find time warping offsets for each file that maximize the dot product
@@ -411,6 +993,31 @@ impl Traces {
         }
     }
 
+    fn apply_time_warps_isotopes(matrix: &mut Matrix, time_warps: &[isize]) {
+        if matrix.rows == 0 {
+            return;
+        }
+
+        for (file, warp) in time_warps.iter().enumerate() {
+            for isotope in 0..N_ISOTOPES {
+                let row = file * N_ISOTOPES + isotope;
+                if row >= matrix.rows {
+                    break;
+                }
+
+                let run = matrix.row_slice_mut(row);
+                let mut shifted = vec![0.0; run.len()];
+                for (i, val) in shifted.iter_mut().enumerate() {
+                    let j = i as isize + warp;
+                    if j >= 0 && j < run.len() as isize {
+                        *val = run[j as usize];
+                    }
+                }
+                run.copy_from_slice(&shifted);
+            }
+        }
+    }
+
     pub fn scores(&self, strategy: PeakScoringStrategy) -> (Vec<f64>, Vec<f64>) {
         let mut spectral = Vec::with_capacity(self.spectral_angle.cols);
         let mut intensity = Vec::with_capacity(self.spectral_angle.cols);
@@ -456,8 +1063,8 @@ impl Traces {
     ///   angle observed across all of the files
     /// * Integrate all of the MS1 traces within said window, returning a vector
     ///   of length `n_files` containing the summed MS1 intensities
-    pub fn integrate(&mut self, settings: &LfqSettings) -> Option<(Peak, Vec<f64>)> {
-        self.warp();
+    pub fn integrate(mut self, settings: &LfqSettings) -> Option<IntegratedTraces> {
+        let time_warps = self.warp();
 
         let (scores, spectral) = self.scores(settings.peak_scoring);
         let mut best = Peak::default();
@@ -517,7 +1124,17 @@ impl Traces {
             summed_int += dotp;
         }
         best.spectral_angle = weighted / summed_int;
-        Some((best, areas))
+        Some(IntegratedTraces {
+            peak: best,
+            intensities: areas,
+            dot_product: self.dot_product,
+            spectral_angle: self.spectral_angle,
+            isotope_traces: self.isotope_traces,
+            raw_isotope_traces: self.raw_isotope_traces,
+            reference_file_id: self.reference_file_id,
+            distribution: self.distribution,
+            time_warps,
+        })
     }
 }
 
@@ -569,6 +1186,7 @@ impl Grid {
     ///   relative to theoretical distribution
     pub fn summarize_traces(&mut self) -> Traces {
         let k = gaussian_kernel(0.5, K_WIDTH);
+        let raw_matrix = self.matrix.clone();
 
         let mut spectral_angle = Matrix::new(
             vec![0.0; self.files * self.matrix.cols],
@@ -614,10 +1232,15 @@ impl Grid {
             }
         }
 
+        let isotope_traces = self.matrix.clone();
+
         Traces {
             dot_product,
             spectral_angle,
+            isotope_traces,
+            raw_isotope_traces: raw_matrix,
             reference_file_id: self.reference_file_id,
+            distribution: self.distribution,
         }
     }
 }
@@ -655,6 +1278,95 @@ fn convolve(slice: &[f64], kernel: &[f64]) -> Vec<f64> {
             w.iter().zip(k).fold(0.0, |acc, (x, y)| acc + x * y)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_test_grid() -> Grid {
+        let entry = PrecursorRange {
+            rt: 50.0,
+            mass_lo: 500.0,
+            mass_hi: 505.0,
+            mobility_lo: 0.0,
+            mobility_hi: 1.0,
+            charge: 2,
+            isotope: 0,
+            peptide: PeptideIx::default(),
+            file_id: 0,
+            decoy: false,
+        };
+
+        let mut grid = Grid::new(&entry, 0.5, [0.6, 0.3, 0.1], 2, 12);
+
+        let rows: [[f64; 12]; N_ISOTOPES * 2] = [
+            [0.0, 0.0, 10.0, 5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 5.0, 2.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 2.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 10.0, 5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 5.0, 2.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 2.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ];
+
+        let mut data = Vec::new();
+        for row in &rows {
+            data.extend_from_slice(row);
+        }
+
+        grid.matrix = Matrix::new(data, grid.files * N_ISOTOPES, grid.matrix.cols);
+        grid
+    }
+
+    fn run_integration(strategy: IntegrationStrategy) {
+        let mut grid = build_test_grid();
+        let expected_raw = grid.matrix.clone();
+
+        let traces = grid.summarize_traces();
+        let raw_from_traces = traces.raw_isotope_traces.clone();
+
+        let mut settings = LfqSettings::default();
+        settings.spectral_angle = 0.0;
+        settings.integration = strategy;
+
+        let integrated = traces
+            .integrate(&settings)
+            .expect("expected integration to succeed");
+
+        assert_eq!(integrated.raw_isotope_traces, expected_raw);
+        assert_eq!(raw_from_traces, expected_raw);
+
+        assert_eq!(integrated.time_warps.len(), 2);
+        assert_eq!(integrated.reference_file_id, 0);
+
+        // The smoothed / warped data should differ from the raw matrix.
+        let changed_bins = integrated
+            .isotope_traces
+            .data
+            .iter()
+            .copied()
+            .zip(expected_raw.data.iter().copied())
+            .filter(|(smoothed, raw)| (smoothed - raw).abs() > 1e-6)
+            .count();
+        assert!(
+            changed_bins > 0,
+            "expected smoothed traces to differ from raw data"
+        );
+
+        // Gaussian smoothing should bleed intensity into neighbouring bins for the reference run.
+        assert!(integrated.isotope_traces[(0, 1)] > 0.0);
+        assert_eq!(expected_raw[(0, 1)], 0.0);
+    }
+
+    #[test]
+    fn integration_preserves_metadata_for_sum() {
+        run_integration(IntegrationStrategy::Sum);
+    }
+
+    #[test]
+    fn integration_preserves_metadata_for_apex() {
+        run_integration(IntegrationStrategy::Apex);
+    }
 }
 
 impl Query<'_> {
@@ -697,3 +1409,6 @@ impl Query<'_> {
         })
     }
 }
+
+#[cfg(test)]
+mod protein_tests;

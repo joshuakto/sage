@@ -1,0 +1,36 @@
+[package]
+name = "sage-lfq"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Label-free quantification using MaxLFQ algorithm for proteomics data"
+documentation = "https://docs.rs/sage-lfq"
+homepage = "https://github.com/joshuakto/sage"
+repository = "https://github.com/joshuakto/sage"
+readme = "README.md"
+keywords = ["proteomics", "quantification", "maxlfq", "mass-spectrometry", "lfq"]
+categories = ["science", "algorithms"]
+rust-version = "1.70"  # Specify minimum Rust version (MSRV)
+
+# Exclude large files and development artifacts from published package
+exclude = [
+    "Patch/",
+    "tests/fixtures/large_data/*",
+    ".gitignore",
+]
+
+# Configuration for docs.rs
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+rayon = "1.7"
+sprs = "0.11"
+nalgebra = "0.32"
+statrs = "0.16"
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "1.0"
+
+[dev-dependencies]
+approx = "0.5"

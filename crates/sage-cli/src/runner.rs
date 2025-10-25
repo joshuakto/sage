@@ -6,10 +6,13 @@ use csv::ByteRecord;
 use log::info;
 use rayon::prelude::*;
 use sage_cloudpath::{CloudPath, FileFormat};
-use sage_core::database::{IndexedDatabase, Parameters, PeptideIx};
+use sage_core::database::{IndexedDatabase, Parameters};
 use sage_core::fasta::Fasta;
 use sage_core::ion_series::Kind;
-use sage_core::lfq::{Peak, PrecursorId};
+use sage_core::lfq::{
+    quantify_protein_groups, MaxLfqConfig, PeptideQuantTrace, PrecursorId, ProteinRollupResult,
+    ProteinQuantTrace,
+};
 use sage_core::mass::Tolerance;
 use sage_core::peptide::Peptide;
 use sage_core::scoring::Fragments;
@@ -558,7 +561,8 @@ impl Runner {
             })
             .collect::<Vec<_>>();
 
-        let areas = alignments.and_then(|alignments| {
+        let mut protein_rollup: Option<Vec<ProteinRollupResult>> = None;
+        let areas = if let Some(alignments) = alignments {
             if self.parameters.quant.lfq {
                 log::trace!("performing LFQ");
                 let mut areas = sage_core::lfq::build_feature_map(
@@ -567,15 +571,69 @@ impl Runner {
                     &outputs.features,
                 )
                 .quantify(&self.database, &outputs.ms1, &alignments);
+                log::trace!("quantified {} precursor traces", areas.len());
 
-                let q_precursor = sage_core::fdr::picked_precursor(&mut areas);
+                let q_precursor = sage_core::fdr::picked_precursor(
+                    &mut areas,
+                    self.parameters.quant.lfq_settings.max_precursor_q,
+                );
 
                 log::info!("discovered {} target MS1 peaks at 5% FDR", q_precursor);
+
+                if self.parameters.quant.lfq_proteins.enabled {
+                    let max_precursor_q = self.parameters.quant.lfq_settings.max_precursor_q;
+                    // Pass ALL target traces (including high q-value) to group_by_accession
+                    // so it can correctly compute total_peptide_count vs passing_peptide_count.
+                    // The q-value filtering happens inside group_by_accession via max_precursor_q.
+                    let mut peptide_traces: Vec<PeptideQuantTrace> = areas
+                        .values()
+                        .filter(|trace| !trace.decoy)
+                        .cloned()
+                        .collect();
+
+                    peptide_traces.sort_unstable_by(|a, b| {
+                        a.peptide
+                            .0
+                            .cmp(&b.peptide.0)
+                            .then_with(|| a.precursor.cmp(&b.precursor))
+                    });
+
+                    if !peptide_traces.is_empty() {
+                        let protein_groups = ProteinQuantTrace::group_by_accession(
+                            &self.database,
+                            &peptide_traces,
+                            filenames.len(),
+                            max_precursor_q,
+                        );
+
+                        let config = MaxLfqConfig {
+                            min_peptides_per_ratio: self.parameters.quant.lfq_proteins.min_peptides,
+                            min_samples_for_protein: self.parameters.quant.lfq_proteins.min_samples,
+                            use_global_normalization: self.parameters.quant.lfq_proteins.normalize,
+                            reference_sample: self.parameters.quant.lfq_proteins.reference_sample,
+                        };
+
+                        protein_rollup = Some(
+                            quantify_protein_groups(
+                                &peptide_traces,
+                                &protein_groups,
+                                max_precursor_q,
+                                config,
+                            )
+                            .map_err(anyhow::Error::from)?,
+                        );
+                    } else {
+                        log::info!("no peptide traces passed protein LFQ filters");
+                    }
+                }
+
                 Some(areas)
             } else {
                 None
             }
-        });
+        } else {
+            None
+        };
 
         log::info!(
             "discovered {} target peptide-spectrum matches at 1% FDR",
@@ -616,6 +674,17 @@ impl Runner {
                 path.write_bytes_sync(bytes)?;
                 self.parameters.output_paths.push(path.to_string());
             }
+
+            if let Some(proteins) = protein_rollup.as_ref() {
+                if !proteins.is_empty() {
+                    let bytes =
+                        sage_cloudpath::parquet::serialize_lfq_proteins(proteins, &filenames)?;
+
+                    let path = self.make_path("lfq_proteins.parquet");
+                    path.write_bytes_sync(bytes)?;
+                    self.parameters.output_paths.push(path.to_string());
+                }
+            }
         } else {
             self.parameters
                 .output_paths
@@ -632,10 +701,18 @@ impl Runner {
                     .output_paths
                     .push(self.write_tmt(&outputs.quant, &filenames)?);
             }
-            if let Some(areas) = areas.clone() {
+            if let Some(areas) = areas.as_ref() {
                 self.parameters
                     .output_paths
                     .push(self.write_lfq(areas, &filenames)?);
+            }
+
+            if let Some(proteins) = protein_rollup.as_ref() {
+                if !proteins.is_empty() {
+                    self.parameters
+                        .output_paths
+                        .push(self.write_lfq_proteins(proteins, &filenames)?);
+                }
             }
         }
 
@@ -1159,7 +1236,7 @@ impl Runner {
 
     pub fn write_lfq(
         &self,
-        areas: HashMap<(PrecursorId, bool), (Peak, Vec<f64>), fnv::FnvBuildHasher>,
+        areas: &HashMap<(PrecursorId, bool), PeptideQuantTrace, fnv::FnvBuildHasher>,
         filenames: &[String],
     ) -> anyhow::Result<String> {
         let path = self.make_path("lfq.tsv");
@@ -1180,13 +1257,13 @@ impl Runner {
         wtr.write_byte_record(&headers)?;
 
         let records = areas
-            .into_par_iter()
-            .filter_map(|((id, decoy), (peak, data))| {
-                if decoy {
+            .par_iter()
+            .filter_map(|(_, trace)| {
+                if trace.decoy {
                     return None;
                 };
                 let mut record = csv::ByteRecord::new();
-                let (peptide_ix, charge) = match id {
+                let (peptide_ix, charge) = match trace.precursor {
                     PrecursorId::Combined(x) => (x, None),
                     PrecursorId::Charged((x, charge)) => (x, Some(charge as i32)),
                 };
@@ -1197,10 +1274,14 @@ impl Runner {
                         .proteins(&self.database.decoy_tag, self.database.generate_decoys)
                         .as_bytes(),
                 );
-                record.push_field(ryu::Buffer::new().format(peak.q_value).as_bytes());
-                record.push_field(ryu::Buffer::new().format(peak.score).as_bytes());
-                record.push_field(ryu::Buffer::new().format(peak.spectral_angle).as_bytes());
-                for x in data {
+                record.push_field(ryu::Buffer::new().format(trace.peak.q_value).as_bytes());
+                record.push_field(ryu::Buffer::new().format(trace.peak.score).as_bytes());
+                record.push_field(
+                    ryu::Buffer::new()
+                        .format(trace.peak.spectral_angle)
+                        .as_bytes(),
+                );
+                for &x in trace.intensities.iter() {
                     record.push_field(ryu::Buffer::new().format(x).as_bytes());
                 }
                 Some(record)
@@ -1217,10 +1298,104 @@ impl Runner {
         Ok(path.to_string())
     }
 
+    pub fn write_lfq_proteins(
+        &self,
+        proteins: &[ProteinRollupResult],
+        filenames: &[String],
+    ) -> anyhow::Result<String> {
+        let path = self.make_path("lfq_proteins.tsv");
+
+        let mut wtr = csv::WriterBuilder::new()
+            .delimiter(b'\t')
+            .from_writer(vec![]);
+
+        let mut headers = csv::ByteRecord::new();
+        headers.push_field(b"proteins");
+        headers.push_field(b"q_value");
+        headers.push_field(b"total_precursors");
+        headers.push_field(b"unique_peptides");
+        headers.push_field(b"lfq_peptide_count");
+        
+        // Intensity columns
+        for name in filenames {
+            headers.push_field(format!("intensity:{}", name).as_bytes());
+        }
+        
+        // Coverage columns (boolean: has any signal)
+        for name in filenames {
+            headers.push_field(format!("coverage:{}", name).as_bytes());
+        }
+        
+        // Contributors columns (count of peptides)
+        for name in filenames {
+            headers.push_field(format!("contributors:{}", name).as_bytes());
+        }
+        
+        wtr.write_byte_record(&headers)?;
+
+        for result in proteins {
+            let mut record = csv::ByteRecord::new();
+            
+            // Protein accessions
+            let proteins_joined = result
+                .accessions
+                .iter()
+                .map(|s| s.as_ref())
+                .collect::<Vec<_>>()
+                .join(";");
+            record.push_field(proteins_joined.as_bytes());
+            
+            // Protein metadata
+            record.push_field(ryu::Buffer::new().format(result.q_value).as_bytes());
+            record.push_field(itoa::Buffer::new().format(result.total_precursors).as_bytes());
+            record.push_field(itoa::Buffer::new().format(result.unique_peptides).as_bytes());
+            record.push_field(itoa::Buffer::new().format(result.quant.peptide_count).as_bytes());
+
+            // MaxLFQ intensities
+            for sample_idx in 0..filenames.len() {
+                let intensity = result
+                    .quant
+                    .lfq_intensities
+                    .get(sample_idx)
+                    .copied()
+                    .unwrap_or_default();
+                record.push_field(ryu::Buffer::new().format(intensity).as_bytes());
+            }
+
+            // Sample coverage (boolean)
+            for sample_idx in 0..filenames.len() {
+                let covered = result
+                    .quant
+                    .sample_coverage
+                    .get(sample_idx)
+                    .copied()
+                    .unwrap_or(false);
+                record.push_field(if covered { b"1" } else { b"0" });
+            }
+            
+            // Contributing peptides per run
+            for sample_idx in 0..filenames.len() {
+                let contributors = result
+                    .run_coverage
+                    .get(sample_idx)
+                    .copied()
+                    .unwrap_or_default();
+                record.push_field(itoa::Buffer::new().format(contributors).as_bytes());
+            }
+
+            wtr.write_byte_record(&record)?;
+        }
+
+        wtr.flush()?;
+        let bytes = wtr.into_inner()?;
+        path.write_bytes_sync(bytes)?;
+        Ok(path.to_string())
+    }
+
     fn write_report(
         &self,
         features: &[Feature],
-        areas: Option<HashMap<(PrecursorId, bool), (Peak, Vec<f64>), fnv::FnvBuildHasher>>,
+        areas: Option<HashMap<(PrecursorId, bool), PeptideQuantTrace, fnv::FnvBuildHasher>>,
         filenames: &[String],
     ) -> anyhow::Result<String> {
         let path = self.make_path("results.sage.report.html");
@@ -1317,9 +1492,9 @@ impl Runner {
                 let mut total_lfq_intensities = Vec::new();
                 for i in 0..filenames.len() {
                     let mut intensities = Vec::new();
-                    for ((id, decoy), (peak, data)) in areas {
-                        if !decoy && peak.q_value <= global_q_value_filter {
-                            intensities.push(data[i] as f32);
+                    for (_, trace) in areas {
+                        if !trace.decoy && trace.peak.q_value <= global_q_value_filter {
+                            intensities.push(trace.intensities[i] as f32);
                         }
                     }
                     total_lfq_intensities.push(intensities.iter().sum());
@@ -1553,9 +1728,9 @@ impl Runner {
                 let mut lfq_intensities: Vec<Vec<f64>> = Vec::new();
                 for i in 0..filenames.len() {
                     let mut intensities = Vec::new();
-                    for ((_id, decoy), (peak, data)) in &areas {
-                        if !decoy && peak.q_value <= global_q_value_filter {
-                            intensities.push(data[i].log2());
+                    for (_, trace) in &areas {
+                        if !trace.decoy && trace.peak.q_value <= global_q_value_filter {
+                            intensities.push(trace.intensities[i].log2());
                         }
                     }
                     lfq_intensities.push(intensities);

@@ -86,6 +86,8 @@ pub struct LfqOptions {
     pub ppm_tolerance: Option<f32>,
     pub mobility_pct_tolerance: Option<f32>,
     pub combine_charge_states: Option<bool>,
+    pub min_peptide_q: Option<f32>,
+    pub max_precursor_q: Option<f32>,
 }
 
 impl From<LfqOptions> for LfqSettings {
@@ -102,6 +104,14 @@ impl From<LfqOptions> for LfqSettings {
             combine_charge_states: value
                 .combine_charge_states
                 .unwrap_or(default.combine_charge_states),
+            min_peptide_q: value
+                .min_peptide_q
+                .unwrap_or(default.min_peptide_q)
+                .clamp(0.0, 1.0),
+            max_precursor_q: value
+                .max_precursor_q
+                .unwrap_or(default.max_precursor_q)
+                .clamp(0.0, 1.0),
         };
         if settings.ppm_tolerance > 20.0 {
             log::warn!("lfq_settings.ppm_tolerance is higher than expected");
@@ -117,6 +127,49 @@ impl From<LfqOptions> for LfqSettings {
         }
 
         settings
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct LfqProteinOptions {
+    pub enabled: Option<bool>,
+    pub min_peptides: Option<usize>,
+    pub min_samples: Option<usize>,
+    pub normalize: Option<bool>,
+    pub reference_sample: Option<usize>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct LfqProteinSettings {
+    pub enabled: bool,
+    pub min_peptides: usize,
+    pub min_samples: usize,
+    pub normalize: bool,
+    pub reference_sample: Option<usize>,
+}
+
+impl Default for LfqProteinSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_peptides: 2,
+            min_samples: 1,
+            normalize: true,
+            reference_sample: None,
+        }
+    }
+}
+
+impl From<LfqProteinOptions> for LfqProteinSettings {
+    fn from(options: LfqProteinOptions) -> Self {
+        let default = Self::default();
+        Self {
+            enabled: options.enabled.unwrap_or(default.enabled),
+            min_peptides: options.min_peptides.unwrap_or(default.min_peptides).max(1),
+            min_samples: options.min_samples.unwrap_or(default.min_samples).max(1),
+            normalize: options.normalize.unwrap_or(default.normalize),
+            reference_sample: options.reference_sample.or(default.reference_sample),
+        }
     }
 }
 
@@ -160,6 +213,9 @@ pub struct QuantOptions {
     pub lfq: Option<bool>,
     #[serde(rename = "lfq_settings")]
     pub lfq_options: Option<LfqOptions>,
+
+    #[serde(rename = "lfq_proteins")]
+    pub lfq_protein_options: Option<LfqProteinOptions>,
 }
 
 #[derive(Serialize, Default, Clone)]
@@ -168,6 +224,7 @@ pub struct QuantSettings {
     pub tmt_settings: TmtSettings,
     pub lfq: bool,
     pub lfq_settings: LfqSettings,
+    pub lfq_proteins: LfqProteinSettings,
 }
 
 impl From<QuantOptions> for QuantSettings {
@@ -178,6 +235,10 @@ impl From<QuantOptions> for QuantSettings {
 
             lfq: value.lfq.unwrap_or(false),
             lfq_settings: value.lfq_options.map(Into::into).unwrap_or_default(),
+            lfq_proteins: value
+                .lfq_protein_options
+                .map(Into::into)
+                .unwrap_or_default(),
         }
     }
 }
