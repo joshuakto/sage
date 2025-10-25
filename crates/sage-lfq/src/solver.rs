@@ -228,7 +228,7 @@ fn is_connected(ratios: &RatioMatrix) -> bool {
     active_indices.iter().all(|idx| visited.contains(idx))
 }
 
-/// FIX REVIEWER ISSUE #2: Proper least-squares solver
+/// Least-squares solver
 ///
 /// Solves the MaxLFQ optimization problem by minimizing:
 /// Σ(i<j) weight[i,j] * (x_i - x_j - ratio[i,j])²
