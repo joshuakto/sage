@@ -1,4 +1,4 @@
-name: Build Sage Executables
+name: Build Sage Executables (fork development)
 
 on:
   release:
