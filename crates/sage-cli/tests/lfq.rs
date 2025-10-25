@@ -675,7 +675,7 @@ fn lfq_outputs_match_golden() -> Result<()> {
 
     let ProteinLfqData {
         run_names: protein_run_names,
-        mut proteins,
+        proteins,
     } = read_lfq_proteins_tsv(&proteins_tsv)?;
     assert_eq!(
         protein_run_names, lfq.run_names,
@@ -808,7 +808,6 @@ fn lfq_outputs_match_golden() -> Result<()> {
         "protein parquet row count mismatch"
     );
 
-    sort_proteins_by_accession(&mut proteins);
     let mut parquet_sorted = parquet_proteins;
     sort_proteins_by_accession(&mut parquet_sorted);
 
