@@ -39,7 +39,7 @@ jobs:
       - name: Build archive
         shell: bash
         run: |
-          sage_version=${{ github.event.inputs.version || github.ref_name }}
+          sage_version=${{ inputs.version || github.ref_name }}
           staging="sage-$sage_version-${{ matrix.target }}"
           mkdir -p "$staging"
           cp {README.md,LICENSE} "$staging/"
@@ -82,7 +82,7 @@ jobs:
       - name: Build archive
         shell: bash
         run: |
-          sage_version=${{ github.event.inputs.version || github.ref_name }}
+          sage_version=${{ inputs.version || github.ref_name }}
           staging="sage-$sage_version-${{ matrix.target }}"
           mkdir -p "$staging"
           cp {README.md,DOCS.md,LICENSE} "$staging/"
@@ -128,7 +128,7 @@ jobs:
       - name: Build archive
         shell: bash
         run: |
-          sage_version=${{ github.event.inputs.version || github.ref_name }}
+          sage_version=${{ inputs.version || github.ref_name }}
           staging="sage-$sage_version-${{ matrix.target }}"
           mkdir -p "$staging"
           cp {README.md,LICENSE} "$staging/"
