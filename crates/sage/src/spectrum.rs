@@ -525,7 +525,7 @@ impl SpectrumProcessor {
 
         let median_peak_intensity = if !peaks.is_empty() {
             let mut intensities: Vec<f32> = peaks.iter().map(|p| p.intensity).collect();
-            intensities.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            intensities.sort_by(|a, b| a.total_cmp(b));
             intensities[intensities.len() / 2].max(1.0)
         } else {
             1.0
@@ -581,7 +581,7 @@ impl SpectrumProcessor {
 
         let median_peak_intensity = if !peaks.is_empty() {
             let mut intensities: Vec<f32> = peaks.iter().map(|p| p.intensity).collect();
-            intensities.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            intensities.sort_by(|a, b| a.total_cmp(b));
             intensities[intensities.len() / 2].max(1.0)
         } else {
             1.0
