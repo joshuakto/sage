@@ -29,6 +29,7 @@ struct Score {
     ppm_difference: f32,
     precursor_charge: u8,
     isotope_error: i8,
+    norm_factor: f32,
 }
 
 impl Eq for Score {}
