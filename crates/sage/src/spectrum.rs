@@ -66,6 +66,23 @@ pub struct SpectrumProcessor {
     pub take_top_n: usize,
     pub min_deisotope_mz: f32,
     pub deisotope: bool,
+    // Experimental: Peak selection configuration
+    pub peak_selection_mode: PeakSelectionMode,
+    pub binned_peaks_per_bin: usize,
+    pub binned_bin_width: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PeakSelectionMode {
+    Global,
+    Binned,
+    Hybrid,
+}
+
+impl Default for PeakSelectionMode {
+    fn default() -> Self {
+        Self::Global
+    }
 }
 
 #[derive(Default, Debug, Clone)]
@@ -97,6 +114,10 @@ pub struct ProcessedSpectrum<T> {
     pub peaks: Vec<T>,
     /// Total ion current
     pub total_ion_current: f32,
+    /// Base peak intensity (for normalization)
+    pub base_peak_intensity: f32,
+    /// Median peak intensity (for normalization)
+    pub median_peak_intensity: f32,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -303,6 +324,117 @@ impl SpectrumProcessor {
             take_top_n,
             min_deisotope_mz,
             deisotope,
+            // Default to current behavior (global selection)
+            peak_selection_mode: PeakSelectionMode::Global,
+            binned_peaks_per_bin: 10,
+            binned_bin_width: 100.0,
+        }
+    }
+
+    /// Create with experimental peak selection configuration
+    pub fn with_peak_selection(
+        take_top_n: usize,
+        deisotope: bool,
+        min_deisotope_mz: f32,
+        peak_selection_mode: PeakSelectionMode,
+        binned_peaks_per_bin: usize,
+        binned_bin_width: f32,
+    ) -> Self {
+        Self {
+            take_top_n,
+            min_deisotope_mz,
+            deisotope,
+            peak_selection_mode,
+            binned_peaks_per_bin,
+            binned_bin_width,
+        }
+    }
+
+    /// Select peaks using binned approach (MaxQuant-style)
+    /// Takes top N peaks per m/z bin, preserving diagnostic ions across full spectrum
+    fn select_peaks_binned(peaks: &[Peak], peaks_per_bin: usize, bin_width: f32) -> Vec<Peak> {
+        if peaks.is_empty() {
+            return Vec::new();
+        }
+
+        // Find max m/z to determine number of bins
+        let max_mz = peaks
+            .iter()
+            .map(|p| p.mass)
+            .fold(0.0f32, f32::max);
+
+        let num_bins = ((max_mz / bin_width).ceil() as usize).max(1);
+
+        let mut selected = Vec::new();
+
+        for bin_idx in 0..num_bins {
+            let min_mz = bin_idx as f32 * bin_width;
+            let max_mz = (bin_idx + 1) as f32 * bin_width;
+
+            // Collect peaks in this bin
+            let mut bin_peaks: Vec<&Peak> = peaks
+                .iter()
+                .filter(|p| p.mass >= min_mz && p.mass < max_mz)
+                .collect();
+
+            // Sort by intensity descending
+            bin_peaks.sort_unstable_by(|a, b| b.intensity.total_cmp(&a.intensity));
+
+            // Take top N from this bin
+            selected.extend(bin_peaks.into_iter().take(peaks_per_bin).cloned());
+        }
+
+        selected
+    }
+
+    /// Hybrid selection: take maximum of global and binned
+    /// Provides safety net - uses whichever method gives more peaks
+    fn select_peaks_hybrid(
+        peaks: &[Peak],
+        global_max: usize,
+        peaks_per_bin: usize,
+        bin_width: f32,
+    ) -> Vec<Peak> {
+        let binned = Self::select_peaks_binned(peaks, peaks_per_bin, bin_width);
+
+        if binned.len() > global_max {
+            // Binned gave us more peaks, use those
+            binned
+        } else {
+            // Global selection gives more, use that
+            let mut sorted = peaks.to_vec();
+            sorted.sort_unstable_by(|a, b| {
+                b.intensity
+                    .total_cmp(&a.intensity)
+                    .then_with(|| a.mass.total_cmp(&b.mass))
+            });
+            sorted.truncate(global_max);
+            sorted
+        }
+    }
+
+    /// Apply configured peak selection method
+    fn apply_peak_selection(&self, mut peaks: Vec<Peak>) -> Vec<Peak> {
+        match self.peak_selection_mode {
+            PeakSelectionMode::Global => {
+                // Current behavior: global top-N by intensity
+                crate::heap::bounded_min_heapify(&mut peaks, self.take_top_n);
+                peaks.truncate(self.take_top_n);
+                peaks
+            }
+            PeakSelectionMode::Binned => {
+                // Experimental: binned selection (MaxQuant-style)
+                Self::select_peaks_binned(&peaks, self.binned_peaks_per_bin, self.binned_bin_width)
+            }
+            PeakSelectionMode::Hybrid => {
+                // Experimental: hybrid approach (safety net)
+                Self::select_peaks_hybrid(
+                    &peaks,
+                    self.take_top_n,
+                    self.binned_peaks_per_bin,
+                    self.binned_bin_width,
+                )
+            }
         }
     }
 
@@ -336,7 +468,7 @@ impl SpectrumProcessor {
                     .then_with(|| a.mz.total_cmp(&b.mz))
             });
 
-            peaks
+            let converted_peaks = peaks
                 .into_iter()
                 .filter(|peak| peak.envelope.is_none())
                 .map(|peak| {
@@ -347,10 +479,12 @@ impl SpectrumProcessor {
                         intensity: peak.intensity,
                     }
                 })
-                .take(self.take_top_n)
-                .collect::<Vec<Peak>>()
+                .collect::<Vec<Peak>>();
+
+            // Apply configured peak selection method
+            self.apply_peak_selection(converted_peaks)
         } else {
-            let mut peaks = spectrum
+            let peaks = spectrum
                 .mz
                 .iter()
                 .zip(spectrum.intensity.iter())
@@ -359,9 +493,9 @@ impl SpectrumProcessor {
                     Peak { mass, intensity }
                 })
                 .collect::<Vec<_>>();
-            crate::heap::bounded_min_heapify(&mut peaks, self.take_top_n);
-            peaks.truncate(self.take_top_n);
-            peaks
+
+            // Apply configured peak selection method
+            self.apply_peak_selection(peaks)
         }
     }
 
@@ -382,6 +516,21 @@ impl SpectrumProcessor {
         peaks.sort_by(|a, b| a.mass.total_cmp(&b.mass));
         let total_ion_current = peaks.iter().map(|peak| peak.intensity).sum::<f32>();
 
+        // Calculate normalization metadata
+        let base_peak_intensity = peaks
+            .iter()
+            .map(|p| p.intensity)
+            .fold(0.0f32, f32::max)
+            .max(1.0); // Avoid division by zero
+
+        let median_peak_intensity = if !peaks.is_empty() {
+            let mut intensities: Vec<f32> = peaks.iter().map(|p| p.intensity).collect();
+            intensities.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            intensities[intensities.len() / 2].max(1.0)
+        } else {
+            1.0
+        };
+
         ProcessedSpectrum {
             level: spectrum.ms_level,
             id: spectrum.id,
@@ -391,6 +540,8 @@ impl SpectrumProcessor {
             precursors: spectrum.precursors,
             peaks,
             total_ion_current,
+            base_peak_intensity,
+            median_peak_intensity,
         }
     }
 
@@ -421,6 +572,21 @@ impl SpectrumProcessor {
         peaks.sort_by(|a, b| a.mass.total_cmp(&b.mass));
         let total_ion_current = peaks.iter().map(|peak| peak.intensity).sum::<f32>();
 
+        // Calculate normalization metadata
+        let base_peak_intensity = peaks
+            .iter()
+            .map(|p| p.intensity)
+            .fold(0.0f32, f32::max)
+            .max(1.0);
+
+        let median_peak_intensity = if !peaks.is_empty() {
+            let mut intensities: Vec<f32> = peaks.iter().map(|p| p.intensity).collect();
+            intensities.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            intensities[intensities.len() / 2].max(1.0)
+        } else {
+            1.0
+        };
+
         ProcessedSpectrum {
             level: spectrum.ms_level,
             id: spectrum.id,
@@ -430,6 +596,8 @@ impl SpectrumProcessor {
             precursors: spectrum.precursors,
             peaks,
             total_ion_current,
+            base_peak_intensity,
+            median_peak_intensity,
         }
     }
 }

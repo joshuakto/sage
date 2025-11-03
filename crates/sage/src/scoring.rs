@@ -225,6 +225,17 @@ pub struct Scorer<'db> {
     pub wide_window: bool,
     pub annotate_matches: bool,
     pub score_type: ScoreType,
+
+    // Experimental: Intensity normalization mode
+    pub intensity_normalization: IntensityNormalization,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum IntensityNormalization {
+    None,
+    BasePeak,
+    Tic,
+    Median,
 }
 
 #[inline(always)]
@@ -678,6 +689,14 @@ impl<'db> Scorer<'db> {
 
         let mut fragments_details = Fragments::default();
 
+        // Calculate normalization factor based on experimental configuration
+        let norm_factor = match self.intensity_normalization {
+            IntensityNormalization::None => 1.0,
+            IntensityNormalization::BasePeak => query.base_peak_intensity,
+            IntensityNormalization::Tic => query.total_ion_current,
+            IntensityNormalization::Median => query.median_peak_intensity,
+        };
+
         for (idx, frag) in fragments {
             for charge in 1..max_fragment_charge {
                 // Experimental peaks are multipled by charge, therefore theoretical are divided
@@ -695,15 +714,18 @@ impl<'db> Scorer<'db> {
                     let exp_mz = peak.mass + PROTON;
                     let calc_mz = mz + PROTON;
 
+                    // Normalize intensity before summing (experimental feature)
+                    let normalized_intensity = peak.intensity / norm_factor;
+
                     match frag.kind {
                         Kind::A | Kind::B | Kind::C => {
                             score.matched_b += 1;
-                            score.summed_b += peak.intensity;
+                            score.summed_b += normalized_intensity;
                             b_run.matched(idx);
                         }
                         Kind::X | Kind::Y | Kind::Z => {
                             score.matched_y += 1;
-                            score.summed_y += peak.intensity;
+                            score.summed_y += normalized_intensity;
                             y_run.matched(idx);
                         }
                     }

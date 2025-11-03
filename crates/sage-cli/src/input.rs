@@ -47,6 +47,8 @@ pub struct Search {
     pub annotate_matches: bool,
 
     pub score_type: ScoreType,
+
+    pub experimental: ExperimentalConfig,
 }
 
 #[derive(Deserialize)]
@@ -76,7 +78,193 @@ pub struct Input {
     pub write_pin: Option<bool>,
     pub write_report: Option<bool>,
     pub score_type: Option<ScoreType>,
+
+    #[serde(default)]
+    pub experimental: ExperimentalConfig,
 }
+
+// ============================================================================
+// Experimental Features Configuration
+// ============================================================================
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ExperimentalConfig {
+    #[serde(default)]
+    pub enable_experimental_features: bool,
+
+    #[serde(default)]
+    pub peak_selection: PeakSelectionConfig,
+
+    #[serde(default)]
+    pub scoring: ScoringConfig,
+
+    #[serde(default)]
+    pub matching: MatchingConfig,
+
+    #[serde(default)]
+    pub deisotoping: DeisotopingConfig,
+
+    #[serde(default)]
+    pub logging: ExperimentalLogging,
+}
+
+impl Default for ExperimentalConfig {
+    fn default() -> Self {
+        Self {
+            enable_experimental_features: false,
+            peak_selection: Default::default(),
+            scoring: Default::default(),
+            matching: Default::default(),
+            deisotoping: Default::default(),
+            logging: Default::default(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum PeakSelectionMode {
+    Global,
+    Binned,
+    Hybrid,
+}
+
+impl Default for PeakSelectionMode {
+    fn default() -> Self {
+        Self::Global
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PeakSelectionConfig {
+    #[serde(default)]
+    pub mode: PeakSelectionMode,
+
+    #[serde(default = "default_global_max_peaks")]
+    pub global_max_peaks: usize,
+
+    #[serde(default = "default_binned_peaks_per_bin")]
+    pub binned_peaks_per_bin: usize,
+
+    #[serde(default = "default_binned_bin_width")]
+    pub binned_bin_width_da: f32,
+}
+
+impl Default for PeakSelectionConfig {
+    fn default() -> Self {
+        Self {
+            mode: PeakSelectionMode::Global,
+            global_max_peaks: 150,
+            binned_peaks_per_bin: 10,
+            binned_bin_width_da: 100.0,
+        }
+    }
+}
+
+fn default_global_max_peaks() -> usize {
+    150
+}
+fn default_binned_peaks_per_bin() -> usize {
+    10
+}
+fn default_binned_bin_width() -> f32 {
+    100.0
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum IntensityNormalization {
+    None,
+    BasePeak,
+    Tic,
+    Median,
+}
+
+impl Default for IntensityNormalization {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ScoringConfig {
+    #[serde(default)]
+    pub intensity_normalization: IntensityNormalization,
+}
+
+impl Default for ScoringConfig {
+    fn default() -> Self {
+        Self {
+            intensity_normalization: IntensityNormalization::None,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct MatchingConfig {
+    #[serde(default = "default_min_matched_peaks")]
+    pub min_matched_peaks: u16,
+
+    #[serde(default)]
+    pub charge_dependent_threshold: bool,
+}
+
+impl Default for MatchingConfig {
+    fn default() -> Self {
+        Self {
+            min_matched_peaks: 4,
+            charge_dependent_threshold: false,
+        }
+    }
+}
+
+fn default_min_matched_peaks() -> u16 {
+    4
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct DeisotopingConfig {
+    #[serde(default = "default_deisotope_tolerance")]
+    pub tolerance_ppm: f32,
+
+    #[serde(default)]
+    pub configurable: bool,
+}
+
+impl Default for DeisotopingConfig {
+    fn default() -> Self {
+        Self {
+            tolerance_ppm: 10.0,
+            configurable: false,
+        }
+    }
+}
+
+fn default_deisotope_tolerance() -> f32 {
+    10.0
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ExperimentalLogging {
+    #[serde(default)]
+    pub track_experimental_metrics: bool,
+
+    #[serde(default)]
+    pub output_diagnostic_tsv: bool,
+}
+
+impl Default for ExperimentalLogging {
+    fn default() -> Self {
+        Self {
+            track_experimental_metrics: false,
+            output_diagnostic_tsv: false,
+        }
+    }
+}
+
+// ============================================================================
+// End Experimental Features Configuration
+// ============================================================================
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct LfqOptions {
@@ -404,6 +592,7 @@ impl Input {
             bruker_config: self.bruker_config.unwrap_or_default(),
             write_report: self.write_report.unwrap_or(false),
             score_type,
+            experimental: self.experimental.clone(),
         })
     }
 }

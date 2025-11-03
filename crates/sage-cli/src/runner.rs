@@ -175,6 +175,19 @@ impl Runner {
                     (Instant::now() - start).as_millis()
                 );
 
+                // Convert CLI intensity normalization enum to core enum
+                use sage_core::scoring::IntensityNormalization;
+                let intensity_norm = if self.parameters.experimental.enable_experimental_features {
+                    match self.parameters.experimental.scoring.intensity_normalization {
+                        crate::input::IntensityNormalization::None => IntensityNormalization::None,
+                        crate::input::IntensityNormalization::BasePeak => IntensityNormalization::BasePeak,
+                        crate::input::IntensityNormalization::Tic => IntensityNormalization::Tic,
+                        crate::input::IntensityNormalization::Median => IntensityNormalization::Median,
+                    }
+                } else {
+                    IntensityNormalization::None
+                };
+
                 let scorer = Scorer {
                     db: &db,
                     precursor_tol: self.parameters.precursor_tol,
@@ -191,6 +204,7 @@ impl Runner {
                     wide_window: self.parameters.wide_window,
                     annotate_matches: self.parameters.annotate_matches,
                     score_type: self.parameters.score_type,
+                    intensity_normalization: intensity_norm,
                 };
 
                 // Allocate an array of booleans indicating whether a peptide was identified in a
@@ -409,11 +423,32 @@ impl Runner {
             None => None,
         };
 
-        let sp = SpectrumProcessor::new(
-            self.parameters.max_peaks,
-            self.parameters.deisotope,
-            min_deisotope_mz.unwrap_or(0.0),
-        );
+        // Create SpectrumProcessor with experimental config if enabled
+        let sp = if self.parameters.experimental.enable_experimental_features {
+            use sage_core::spectrum::PeakSelectionMode;
+
+            // Convert CLI enum to core enum
+            let mode = match self.parameters.experimental.peak_selection.mode {
+                crate::input::PeakSelectionMode::Global => PeakSelectionMode::Global,
+                crate::input::PeakSelectionMode::Binned => PeakSelectionMode::Binned,
+                crate::input::PeakSelectionMode::Hybrid => PeakSelectionMode::Hybrid,
+            };
+
+            SpectrumProcessor::with_peak_selection(
+                self.parameters.max_peaks,
+                self.parameters.deisotope,
+                min_deisotope_mz.unwrap_or(0.0),
+                mode,
+                self.parameters.experimental.peak_selection.binned_peaks_per_bin,
+                self.parameters.experimental.peak_selection.binned_bin_width_da,
+            )
+        } else {
+            SpectrumProcessor::new(
+                self.parameters.max_peaks,
+                self.parameters.deisotope,
+                min_deisotope_mz.unwrap_or(0.0),
+            )
+        };
 
         // If the file format supports parallel reading, then we can read
         // then it is faster to read each file in series. (since each spectra
@@ -504,6 +539,19 @@ impl Runner {
     }
 
     pub fn run(mut self, parallel: usize, parquet: bool) -> anyhow::Result<telemetry::Telemetry> {
+        // Convert CLI intensity normalization enum to core enum
+        use sage_core::scoring::IntensityNormalization;
+        let intensity_norm = if self.parameters.experimental.enable_experimental_features {
+            match self.parameters.experimental.scoring.intensity_normalization {
+                crate::input::IntensityNormalization::None => IntensityNormalization::None,
+                crate::input::IntensityNormalization::BasePeak => IntensityNormalization::BasePeak,
+                crate::input::IntensityNormalization::Tic => IntensityNormalization::Tic,
+                crate::input::IntensityNormalization::Median => IntensityNormalization::Median,
+            }
+        } else {
+            IntensityNormalization::None
+        };
+
         let scorer = Scorer {
             db: &self.database,
             precursor_tol: self.parameters.precursor_tol,
@@ -520,6 +568,7 @@ impl Runner {
             wide_window: self.parameters.wide_window,
             annotate_matches: self.parameters.annotate_matches,
             score_type: self.parameters.score_type,
+            intensity_normalization: intensity_norm,
         };
 
         //Collect all results into a single container
