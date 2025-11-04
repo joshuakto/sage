@@ -170,6 +170,8 @@ fn quantify_feature_map_emits_target_and_decoy_traces() {
             precursors: vec![],
             peaks: vec![],
             total_ion_current: 0.0,
+            base_peak_intensity: 0.0,
+            median_peak_intensity: 0.0,
         },
         ProcessedSpectrum {
             level: 1,
@@ -189,6 +191,8 @@ fn quantify_feature_map_emits_target_and_decoy_traces() {
                 },
             ],
             total_ion_current: 875.0,
+            base_peak_intensity: 500.0,
+            median_peak_intensity: 437.5,
         },
         ProcessedSpectrum {
             level: 1,
@@ -208,6 +212,8 @@ fn quantify_feature_map_emits_target_and_decoy_traces() {
                 },
             ],
             total_ion_current: 1_750.0,
+            base_peak_intensity: 1_000.0,
+            median_peak_intensity: 875.0,
         },
         ProcessedSpectrum {
             level: 1,
@@ -227,6 +233,8 @@ fn quantify_feature_map_emits_target_and_decoy_traces() {
                 },
             ],
             total_ion_current: 1_050.0,
+            base_peak_intensity: 600.0,
+            median_peak_intensity: 525.0,
         },
     ]);
 

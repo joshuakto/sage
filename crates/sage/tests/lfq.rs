@@ -127,6 +127,8 @@ fn quantify_emits_target_and_decoy_traces() {
             },
         ],
         total_ion_current: 200.0,
+        base_peak_intensity: 120.0,
+        median_peak_intensity: 100.0,
     };
 
     let spectra = MS1Spectra::NoMobility(vec![spectrum]);

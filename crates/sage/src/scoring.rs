@@ -21,12 +21,15 @@ struct Score {
     matched_y: u16,
     summed_b: f32,
     summed_y: f32,
+    raw_summed_b: f32,
+    raw_summed_y: f32,
     longest_b: usize,
     longest_y: usize,
     hyperscore: f64,
     ppm_difference: f32,
     precursor_charge: u8,
     isotope_error: i8,
+    norm_factor: f32,
 }
 
 impl Eq for Score {}
@@ -225,6 +228,17 @@ pub struct Scorer<'db> {
     pub wide_window: bool,
     pub annotate_matches: bool,
     pub score_type: ScoreType,
+
+    // Experimental: Intensity normalization mode
+    pub intensity_normalization: IntensityNormalization,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum IntensityNormalization {
+    None,
+    BasePeak,
+    Tic,
+    Median,
 }
 
 #[inline(always)]
@@ -556,8 +570,11 @@ impl<'db> Scorer<'db> {
                 delta_next: score.hyperscore - next,
                 delta_best: best - score.hyperscore,
                 matched_peaks: k as u32,
-                matched_intensity_pct: 100.0 * (score.summed_b + score.summed_y)
-                    / query.total_ion_current,
+                matched_intensity_pct: if query.total_ion_current > 0.0 {
+                    100.0 * (score.raw_summed_b + score.raw_summed_y) / query.total_ion_current
+                } else {
+                    0.0
+                },
                 poisson: poisson.log10(),
                 longest_b: score.longest_b as u32,
                 longest_y: score.longest_y as u32,
@@ -577,7 +594,7 @@ impl<'db> Scorer<'db> {
                 aligned_rt: query.scan_start_time,
                 delta_rt_model: 0.999,
                 delta_ims_model: 0.999,
-                ms2_intensity: score.summed_b + score.summed_y,
+                ms2_intensity: score.raw_summed_b + score.raw_summed_y,
 
                 //Fragments
                 fragments,
@@ -678,6 +695,15 @@ impl<'db> Scorer<'db> {
 
         let mut fragments_details = Fragments::default();
 
+        // Calculate normalization factor based on experimental configuration
+        let norm_factor = match self.intensity_normalization {
+            IntensityNormalization::None => 1.0,
+            IntensityNormalization::BasePeak => query.base_peak_intensity,
+            IntensityNormalization::Tic => query.total_ion_current,
+            IntensityNormalization::Median => query.median_peak_intensity,
+        }
+        .max(f32::MIN_POSITIVE);
+
         for (idx, frag) in fragments {
             for charge in 1..max_fragment_charge {
                 // Experimental peaks are multipled by charge, therefore theoretical are divided
@@ -695,15 +721,21 @@ impl<'db> Scorer<'db> {
                     let exp_mz = peak.mass + PROTON;
                     let calc_mz = mz + PROTON;
 
+                    // Normalize intensity before summing (experimental feature)
+                    let intensity = peak.intensity;
+                    let normalized_intensity = intensity / norm_factor;
+
                     match frag.kind {
                         Kind::A | Kind::B | Kind::C => {
                             score.matched_b += 1;
-                            score.summed_b += peak.intensity;
+                            score.summed_b += normalized_intensity;
+                            score.raw_summed_b += intensity;
                             b_run.matched(idx);
                         }
                         Kind::X | Kind::Y | Kind::Z => {
                             score.matched_y += 1;
-                            score.summed_y += peak.intensity;
+                            score.summed_y += normalized_intensity;
+                            score.raw_summed_y += intensity;
                             y_run.matched(idx);
                         }
                     }
@@ -729,7 +761,7 @@ impl<'db> Scorer<'db> {
         score.hyperscore = score.hyperscore(self.score_type);
         score.longest_b = b_run.longest;
         score.longest_y = y_run.longest;
-        score.ppm_difference /= score.summed_b + score.summed_y;
+        score.ppm_difference /= (score.raw_summed_b + score.raw_summed_y).max(f32::MIN_POSITIVE);
 
         if self.annotate_matches {
             (score, Some(fragments_details))
