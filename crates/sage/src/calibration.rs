@@ -69,7 +69,7 @@ pub struct CalibrationReport {
     pub should_correct: bool,
 }
 
-/// Apply systematic mass offset correction to features
+/// Apply systematic mass offset correction to features (global, all files)
 ///
 /// This function corrects the delta_mass (ppm error) by subtracting the systematic offset.
 /// This is equivalent to recalibrating the precursor m/z values.
@@ -96,7 +96,37 @@ pub fn apply_mz_correction(features: &mut [Feature], offset_ppm: f32) -> usize {
     corrected
 }
 
-/// Assess mass calibration quality from high-confidence PSMs
+/// Apply per-file mass offset correction to features
+///
+/// This function applies different corrections to each file based on file-specific calibration.
+///
+/// # Arguments
+/// * `features` - Mutable slice of features to update with corrected delta_mass
+/// * `file_offsets` - Map of file_id to offset_ppm for that file
+///
+/// # Returns
+/// Number of features corrected
+pub fn apply_per_file_mz_correction(
+    features: &mut [Feature],
+    file_offsets: &[(usize, f32)],
+) -> usize {
+    let mut corrected = 0;
+
+    for (file_id, offset_ppm) in file_offsets {
+        if offset_ppm.abs() < 0.01 {
+            continue; // Skip negligible corrections
+        }
+
+        for feature in features.iter_mut().filter(|f| f.file_id == *file_id) {
+            feature.delta_mass -= offset_ppm;
+            corrected += 1;
+        }
+    }
+
+    corrected
+}
+
+/// Assess mass calibration quality from high-confidence PSMs for a specific file
 ///
 /// This function analyzes the precursor mass errors from confident PSMs
 /// to detect systematic mass offset that might indicate poor instrument calibration.
@@ -104,14 +134,23 @@ pub fn apply_mz_correction(features: &mut [Feature], offset_ppm: f32) -> usize {
 /// # Arguments
 /// * `features` - Array of PSM features from database search
 /// * `fdr_threshold` - FDR threshold for selecting high-confidence PSMs (typically 0.001)
+/// * `file_id` - Optional file ID to assess (None = all files combined, for backward compat)
 ///
 /// # Returns
 /// A `CalibrationReport` containing calibration statistics and recommendations
-pub fn assess_calibration(features: &[Feature], fdr_threshold: f32) -> CalibrationReport {
-    // Filter to high-confidence target PSMs
+pub fn assess_calibration(
+    features: &[Feature],
+    fdr_threshold: f32,
+    file_id: Option<usize>,
+) -> CalibrationReport {
+    // Filter to high-confidence target PSMs (optionally for specific file)
     let mut mass_errors: Vec<f32> = features
         .iter()
-        .filter(|f| f.label == 1 && f.spectrum_q <= fdr_threshold)
+        .filter(|f| {
+            f.label == 1
+                && f.spectrum_q <= fdr_threshold
+                && file_id.map_or(true, |id| f.file_id == id)
+        })
         .map(|f| f.delta_mass)
         .collect();
 
@@ -275,7 +314,7 @@ mod tests {
             .map(|i| make_test_feature((i % 20) as f32 * 0.1 - 1.0, 0.0001, 1))
             .collect();
 
-        let report = assess_calibration(&features, 0.001);
+        let report = assess_calibration(&features, 0.001, None);
 
         assert_eq!(report.quality, CalibrationQuality::Good);
         assert!(report.median_error_ppm.abs() < 2.0);
@@ -288,7 +327,7 @@ mod tests {
             .map(|i| make_test_feature(5.5 + (i % 20) as f32 * 0.1, 0.0001, 1))
             .collect();
 
-        let report = assess_calibration(&features, 0.001);
+        let report = assess_calibration(&features, 0.001, None);
 
         assert_eq!(report.quality, CalibrationQuality::Poor);
         assert!(report.median_error_ppm > 4.0);
@@ -298,7 +337,7 @@ mod tests {
     #[test]
     fn test_no_psms() {
         let features: Vec<Feature> = vec![];
-        let report = assess_calibration(&features, 0.001);
+        let report = assess_calibration(&features, 0.001, None);
 
         assert_eq!(report.num_psms_used, 0);
         assert_eq!(report.quality, CalibrationQuality::Good);
@@ -316,11 +355,45 @@ mod tests {
             (0..500).map(|i| make_test_feature(10.0 + (i % 20) as f32 * 0.1, 0.0001, -1)),
         );
 
-        let report = assess_calibration(&features, 0.001);
+        let report = assess_calibration(&features, 0.001, None);
 
         // Should only use targets, so median should be close to 0
         assert!(report.median_error_ppm.abs() < 2.0);
         assert_eq!(report.num_psms_used, 500);
+    }
+
+    #[test]
+    fn test_per_file_calibration() {
+        // Create features from two files with different calibration
+        let mut features: Vec<Feature> = vec![];
+
+        // File 0: Poor calibration (5.5 ppm offset)
+        for i in 0..500 {
+            let mut f = make_test_feature(5.5 + (i % 20) as f32 * 0.1, 0.0001, 1);
+            f.file_id = 0;
+            features.push(f);
+        }
+
+        // File 1: Good calibration (0.5 ppm offset)
+        for i in 0..500 {
+            let mut f = make_test_feature(0.5 + (i % 20) as f32 * 0.1, 0.0001, 1);
+            f.file_id = 1;
+            features.push(f);
+        }
+
+        // Assess file 0 - should be poor
+        let report0 = assess_calibration(&features, 0.001, Some(0));
+        assert_eq!(report0.quality, CalibrationQuality::Poor);
+        assert!(report0.median_error_ppm > 5.0);
+
+        // Assess file 1 - should be good
+        let report1 = assess_calibration(&features, 0.001, Some(1));
+        assert_eq!(report1.quality, CalibrationQuality::Good);
+        assert!(report1.median_error_ppm.abs() < 2.0);
+
+        // Global assessment - should be intermediate
+        let report_global = assess_calibration(&features, 0.001, None);
+        assert!(report_global.median_error_ppm > 2.0 && report_global.median_error_ppm < 5.0);
     }
 
     #[test]

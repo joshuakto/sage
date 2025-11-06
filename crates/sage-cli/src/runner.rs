@@ -545,95 +545,103 @@ impl Runner {
             None
         };
 
+        // FIRST PASS: Initial FDR calculation to assess calibration
+        let _q_spectrum_initial = self.spectrum_fdr(&mut outputs.features);
+
+        // Assess mass calibration quality PER FILE using high-confidence PSMs from first pass
+        let num_files = self.parameters.mzml_paths.len();
+        let mut per_file_corrections: Vec<(usize, f32)> = Vec::new();
+        let mut any_correction_needed = false;
+
+        log::info!("Assessing mass calibration for {} files...", num_files);
+
+        for file_id in 0..num_files {
+            let calibration_report = sage_core::calibration::assess_calibration(
+                &outputs.features,
+                self.parameters.calibration.fdr_threshold,
+                Some(file_id),
+            );
+
+            let filename = self
+                .parameters
+                .mzml_paths
+                .get(file_id)
+                .map(|s| {
+                    s.parse::<CloudPath>()
+                        .ok()
+                        .and_then(|c| c.filename().map(|s| s.to_string()))
+                        .unwrap_or_else(|| s.clone())
+                })
+                .unwrap_or_else(|| format!("file_{}", file_id));
+
+            let should_correct_this_file = self.parameters.calibration.enabled
+                && calibration_report.median_error_ppm.abs()
+                    >= self.parameters.calibration.min_offset_ppm
+                && calibration_report.confidence >= self.parameters.calibration.min_confidence
+                && calibration_report.num_psms_used >= self.parameters.calibration.min_psms;
+
+            // Log per-file calibration status
+            use sage_core::calibration::CalibrationQuality;
+            match calibration_report.quality {
+                CalibrationQuality::Good => {
+                    log::info!(
+                        "  File {}: ✓ Good calibration (median: {:.2} ppm, n={})",
+                        filename,
+                        calibration_report.median_error_ppm,
+                        calibration_report.num_psms_used
+                    );
+                }
+                CalibrationQuality::Fair | CalibrationQuality::Poor => {
+                    log::warn!(
+                        "  File {}: ⚠️  {:?} calibration (median: {:.2} ppm, n={})",
+                        filename,
+                        calibration_report.quality,
+                        calibration_report.median_error_ppm,
+                        calibration_report.num_psms_used
+                    );
+                    if should_correct_this_file {
+                        log::info!(
+                            "    → Will apply {:.2} ppm correction",
+                            calibration_report.median_error_ppm
+                        );
+                        per_file_corrections.push((file_id, calibration_report.median_error_ppm));
+                        any_correction_needed = true;
+                    } else if !self.parameters.calibration.enabled {
+                        log::warn!("    → Calibration disabled in config");
+                    } else {
+                        log::warn!("    → Not correcting (thresholds not met)");
+                    }
+                }
+            }
+        }
+
+        // Apply per-file correction BEFORE final FDR if approved
+        if any_correction_needed
+            && self.parameters.calibration_mode != sage_core::calibration::CalibrationMode::Strict
+        {
+            let corrected_count = sage_core::calibration::apply_per_file_mz_correction(
+                &mut outputs.features,
+                &per_file_corrections,
+            );
+            log::info!(
+                "✓ Per-file mass recalibration applied: corrected {} features across {} files",
+                corrected_count,
+                per_file_corrections.len()
+            );
+
+            // SECOND PASS: Recalculate FDR with corrected delta_mass values
+            // This ensures q-values reflect the corrected mass errors
+            log::debug!("Recalculating FDR with corrected mass errors...");
+        } else if self.parameters.calibration_mode
+            == sage_core::calibration::CalibrationMode::Strict
+        {
+            log::info!("Strict mode: No mass recalibration applied");
+        }
+
+        // Final FDR calculation (either first-time if no correction, or second-time after correction)
         let q_spectrum = self.spectrum_fdr(&mut outputs.features);
         let q_peptide = sage_core::fdr::picked_peptide(&self.database, &mut outputs.features);
         let q_protein = sage_core::fdr::picked_protein(&self.database, &mut outputs.features);
-
-        // Assess mass calibration quality using high-confidence PSMs
-        let calibration_report = sage_core::calibration::assess_calibration(
-            &outputs.features,
-            self.parameters.calibration.fdr_threshold,
-        );
-
-        // Decide whether to apply mass recalibration
-        let should_apply_correction = self.parameters.calibration.enabled
-            && calibration_report.median_error_ppm.abs() >= self.parameters.calibration.min_offset_ppm
-            && calibration_report.confidence >= self.parameters.calibration.min_confidence
-            && calibration_report.num_psms_used >= self.parameters.calibration.min_psms;
-
-        // Log calibration status based on mode
-        use sage_core::calibration::{CalibrationMode, CalibrationQuality};
-        match calibration_report.quality {
-            CalibrationQuality::Good => {
-                log::info!(
-                    "✓ Good mass calibration detected (median error: {:.2} ppm)",
-                    calibration_report.median_error_ppm
-                );
-            }
-            CalibrationQuality::Fair => {
-                log::warn!(
-                    "⚠️  Fair mass calibration (median error: {:.2} ppm, expected <2 ppm)",
-                    calibration_report.median_error_ppm
-                );
-                if should_apply_correction {
-                    log::info!("   Applying mass recalibration ({} PSMs used)", calibration_report.num_psms_used);
-                }
-            }
-            CalibrationQuality::Poor => {
-                log::warn!("⚠️  POOR MASS CALIBRATION DETECTED");
-                log::warn!("   Median mass error: {:.2} ppm (expected <2 ppm for high-quality instruments)",
-                          calibration_report.median_error_ppm);
-                log::warn!("   Std deviation: {:.2} ppm | MAD: {:.2} ppm",
-                          calibration_report.std_dev_ppm,
-                          calibration_report.mad_ppm);
-                log::warn!("   PSMs within tolerance: 1ppm={:.1}% | 3ppm={:.1}% | 5ppm={:.1}%",
-                          calibration_report.within_1ppm_pct,
-                          calibration_report.within_3ppm_pct,
-                          calibration_report.within_5ppm_pct);
-
-                if should_apply_correction {
-                    match self.parameters.calibration_mode {
-                        CalibrationMode::Auto => {
-                            log::warn!("   ⚠️  Applying mass recalibration to correct systematic offset");
-                            log::warn!("   Original median: {:.2} ppm", calibration_report.median_error_ppm);
-                        }
-                        CalibrationMode::Strict => {
-                            log::warn!("   Strict mode: Mass recalibration is disabled");
-                            log::warn!("   This may significantly reduce identification rates");
-                        }
-                        CalibrationMode::Adaptive => {
-                            log::info!("   Adaptive mode: Applying mass recalibration");
-                        }
-                    }
-                } else {
-                    if !self.parameters.calibration.enabled {
-                        log::warn!("   Mass recalibration is disabled in config");
-                        log::warn!("   Set 'calibration.enabled: true' to enable automatic correction");
-                    } else if calibration_report.num_psms_used < self.parameters.calibration.min_psms {
-                        log::warn!("   Too few PSMs for reliable correction (n={}, min={})",
-                                  calibration_report.num_psms_used,
-                                  self.parameters.calibration.min_psms);
-                    } else if calibration_report.confidence < self.parameters.calibration.min_confidence {
-                        log::warn!("   Confidence too low for automatic correction (conf={:.2}, min={:.2})",
-                                  calibration_report.confidence,
-                                  self.parameters.calibration.min_confidence);
-                    }
-                }
-            }
-        }
-
-        // Apply correction if approved
-        if should_apply_correction && self.parameters.calibration_mode != CalibrationMode::Strict {
-            let corrected_count = sage_core::calibration::apply_mz_correction(
-                &mut outputs.features,
-                calibration_report.median_error_ppm,
-            );
-            log::info!(
-                "✓ Mass recalibration applied: corrected {} features by {:.2} ppm",
-                corrected_count,
-                calibration_report.median_error_ppm
-            );
-        }
 
         let filenames = self
             .parameters
@@ -802,10 +810,16 @@ impl Runner {
             }
         }
 
-        // Write calibration QC report
+        // Write calibration QC report (for now, write a global summary for backward compat)
+        // TODO: Write per-file calibration reports
+        let global_calibration_report = sage_core::calibration::assess_calibration(
+            &outputs.features,
+            self.parameters.calibration.fdr_threshold,
+            None, // Global assessment
+        );
         self.parameters
             .output_paths
-            .push(self.write_calibration_report(&calibration_report)?);
+            .push(self.write_calibration_report(&global_calibration_report)?);
 
         // Write percolator input file if requested
         if self.parameters.write_pin {
