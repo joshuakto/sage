@@ -49,6 +49,7 @@ pub struct Search {
 
     pub score_type: ScoreType,
     pub calibration_mode: CalibrationMode,
+    pub calibration: CalibrationSettings,
 }
 
 #[derive(Deserialize)]
@@ -79,6 +80,55 @@ pub struct Input {
     pub write_report: Option<bool>,
     pub score_type: Option<ScoreType>,
     pub calibration_mode: Option<String>,
+    pub calibration: Option<CalibrationOptions>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct CalibrationOptions {
+    /// Enable automatic mass recalibration (default: false for safety)
+    pub enabled: Option<bool>,
+    /// Minimum FDR threshold for PSMs used in calibration (default: 0.001)
+    pub fdr_threshold: Option<f32>,
+    /// Minimum median offset to trigger correction (default: 2.0 ppm)
+    pub min_offset_ppm: Option<f32>,
+    /// Minimum confidence to apply correction (default: 0.8)
+    pub min_confidence: Option<f32>,
+    /// Minimum number of PSMs required for calibration (default: 100)
+    pub min_psms: Option<usize>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct CalibrationSettings {
+    pub enabled: bool,
+    pub fdr_threshold: f32,
+    pub min_offset_ppm: f32,
+    pub min_confidence: f32,
+    pub min_psms: usize,
+}
+
+impl Default for CalibrationSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false, // Conservative default - must be explicitly enabled
+            fdr_threshold: 0.001,
+            min_offset_ppm: 2.0,
+            min_confidence: 0.8,
+            min_psms: 100,
+        }
+    }
+}
+
+impl From<CalibrationOptions> for CalibrationSettings {
+    fn from(options: CalibrationOptions) -> Self {
+        let default = Self::default();
+        Self {
+            enabled: options.enabled.unwrap_or(default.enabled),
+            fdr_threshold: options.fdr_threshold.unwrap_or(default.fdr_threshold),
+            min_offset_ppm: options.min_offset_ppm.unwrap_or(default.min_offset_ppm),
+            min_confidence: options.min_confidence.unwrap_or(default.min_confidence),
+            min_psms: options.min_psms.unwrap_or(default.min_psms),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -391,6 +441,8 @@ impl Input {
             .and_then(|s| CalibrationMode::from_str(s))
             .unwrap_or_default();
 
+        let calibration = self.calibration.map(Into::into).unwrap_or_default();
+
         Ok(Search {
             version: clap::crate_version!().into(),
             database,
@@ -418,6 +470,7 @@ impl Input {
             write_report: self.write_report.unwrap_or(false),
             score_type,
             calibration_mode,
+            calibration,
         })
     }
 }

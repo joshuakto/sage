@@ -69,6 +69,33 @@ pub struct CalibrationReport {
     pub should_correct: bool,
 }
 
+/// Apply systematic mass offset correction to features
+///
+/// This function corrects the delta_mass (ppm error) by subtracting the systematic offset.
+/// This is equivalent to recalibrating the precursor m/z values.
+///
+/// # Arguments
+/// * `features` - Mutable slice of features to update with corrected delta_mass
+/// * `offset_ppm` - Systematic offset in ppm to correct (typically median error)
+///
+/// # Returns
+/// Number of features corrected
+pub fn apply_mz_correction(features: &mut [Feature], offset_ppm: f32) -> usize {
+    if offset_ppm.abs() < 0.01 {
+        return 0; // No meaningful correction needed
+    }
+
+    let mut corrected = 0;
+    for feature in features.iter_mut() {
+        // Simply subtract the systematic offset from the delta_mass
+        // delta_mass is already in ppm, so we just correct it
+        feature.delta_mass -= offset_ppm;
+        corrected += 1;
+    }
+
+    corrected
+}
+
 /// Assess mass calibration quality from high-confidence PSMs
 ///
 /// This function analyzes the precursor mass errors from confident PSMs
@@ -311,5 +338,46 @@ mod tests {
             Some(CalibrationMode::Adaptive)
         );
         assert_eq!(CalibrationMode::from_str("invalid"), None);
+    }
+
+    #[test]
+    fn test_apply_mz_correction() {
+        let mut features: Vec<Feature> = vec![
+            make_test_feature(5.0, 0.0001, 1),  // 5 ppm offset
+            make_test_feature(5.5, 0.0001, 1),  // 5.5 ppm offset
+            make_test_feature(4.5, 0.0001, 1),  // 4.5 ppm offset
+        ];
+
+        // Apply 5 ppm correction
+        let corrected = apply_mz_correction(&mut features, 5.0);
+
+        assert_eq!(corrected, 3);
+        // After correction, delta_mass should be close to 0
+        for feature in &features {
+            assert!(feature.delta_mass.abs() < 1.0, "Expected corrected delta_mass < 1 ppm, got {}", feature.delta_mass);
+        }
+    }
+
+    #[test]
+    fn test_apply_mz_correction_no_op() {
+        let mut features: Vec<Feature> = vec![make_test_feature(0.5, 0.0001, 1)];
+        let original_delta = features[0].delta_mass;
+
+        // Apply negligible correction
+        let corrected = apply_mz_correction(&mut features, 0.005);
+
+        assert_eq!(corrected, 0);
+        assert_eq!(features[0].delta_mass, original_delta);
+    }
+
+    #[test]
+    fn test_apply_mz_correction_negative_offset() {
+        let mut features: Vec<Feature> = vec![make_test_feature(-5.0, 0.0001, 1)];
+
+        // Apply -5 ppm correction
+        let corrected = apply_mz_correction(&mut features, -5.0);
+
+        assert_eq!(corrected, 1);
+        assert!(features[0].delta_mass.abs() < 1.0);
     }
 }

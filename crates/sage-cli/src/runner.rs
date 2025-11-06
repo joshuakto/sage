@@ -550,7 +550,16 @@ impl Runner {
         let q_protein = sage_core::fdr::picked_protein(&self.database, &mut outputs.features);
 
         // Assess mass calibration quality using high-confidence PSMs
-        let calibration_report = sage_core::calibration::assess_calibration(&outputs.features, 0.001);
+        let calibration_report = sage_core::calibration::assess_calibration(
+            &outputs.features,
+            self.parameters.calibration.fdr_threshold,
+        );
+
+        // Decide whether to apply mass recalibration
+        let should_apply_correction = self.parameters.calibration.enabled
+            && calibration_report.median_error_ppm.abs() >= self.parameters.calibration.min_offset_ppm
+            && calibration_report.confidence >= self.parameters.calibration.min_confidence
+            && calibration_report.num_psms_used >= self.parameters.calibration.min_psms;
 
         // Log calibration status based on mode
         use sage_core::calibration::{CalibrationMode, CalibrationQuality};
@@ -566,13 +575,8 @@ impl Runner {
                     "⚠️  Fair mass calibration (median error: {:.2} ppm, expected <2 ppm)",
                     calibration_report.median_error_ppm
                 );
-                if calibration_report.should_correct {
-                    match self.parameters.calibration_mode {
-                        CalibrationMode::Auto => {
-                            log::warn!("   Consider re-calibrating instrument or using tighter tolerances");
-                        }
-                        _ => {}
-                    }
+                if should_apply_correction {
+                    log::info!("   Applying mass recalibration ({} PSMs used)", calibration_report.num_psms_used);
                 }
             }
             CalibrationQuality::Poor => {
@@ -587,27 +591,48 @@ impl Runner {
                           calibration_report.within_3ppm_pct,
                           calibration_report.within_5ppm_pct);
 
-                if calibration_report.should_correct {
+                if should_apply_correction {
                     match self.parameters.calibration_mode {
                         CalibrationMode::Auto => {
-                            log::warn!("   ⚠️  Mass recalibration would help but is not yet implemented in Phase 1");
-                            log::warn!("   Recommendation: Check instrument calibration before re-acquisition");
-                            log::warn!("   Use --calibration-mode strict to enforce quality standards");
+                            log::warn!("   ⚠️  Applying mass recalibration to correct systematic offset");
+                            log::warn!("   Original median: {:.2} ppm", calibration_report.median_error_ppm);
                         }
                         CalibrationMode::Strict => {
-                            log::warn!("   Strict mode: No automatic correction applied");
+                            log::warn!("   Strict mode: Mass recalibration is disabled");
                             log::warn!("   This may significantly reduce identification rates");
                         }
                         CalibrationMode::Adaptive => {
-                            log::info!("   Adaptive mode: Mass recalibration would be applied (not yet implemented)");
+                            log::info!("   Adaptive mode: Applying mass recalibration");
                         }
                     }
                 } else {
-                    log::warn!("   Confidence too low for automatic correction (n={}, conf={:.2})",
-                              calibration_report.num_psms_used,
-                              calibration_report.confidence);
+                    if !self.parameters.calibration.enabled {
+                        log::warn!("   Mass recalibration is disabled in config");
+                        log::warn!("   Set 'calibration.enabled: true' to enable automatic correction");
+                    } else if calibration_report.num_psms_used < self.parameters.calibration.min_psms {
+                        log::warn!("   Too few PSMs for reliable correction (n={}, min={})",
+                                  calibration_report.num_psms_used,
+                                  self.parameters.calibration.min_psms);
+                    } else if calibration_report.confidence < self.parameters.calibration.min_confidence {
+                        log::warn!("   Confidence too low for automatic correction (conf={:.2}, min={:.2})",
+                                  calibration_report.confidence,
+                                  self.parameters.calibration.min_confidence);
+                    }
                 }
             }
+        }
+
+        // Apply correction if approved
+        if should_apply_correction && self.parameters.calibration_mode != CalibrationMode::Strict {
+            let corrected_count = sage_core::calibration::apply_mz_correction(
+                &mut outputs.features,
+                calibration_report.median_error_ppm,
+            );
+            log::info!(
+                "✓ Mass recalibration applied: corrected {} features by {:.2} ppm",
+                corrected_count,
+                calibration_report.median_error_ppm
+            );
         }
 
         let filenames = self
