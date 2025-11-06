@@ -83,6 +83,12 @@ fn main() -> anyhow::Result<()> {
                 .help("Write `.html` report file"),
         )
         .arg(
+            Arg::new("calibration-mode")
+                .long("calibration-mode")
+                .value_parser(["auto", "strict", "adaptive"])
+                .help("Mass calibration handling: 'auto' (default, warn and correct), 'strict' (never correct), 'adaptive' (quietly correct)"),
+        )
+        .arg(
             Arg::new("disable-telemetry")
                 .long("disable-telemetry-i-dont-want-to-improve-sage")
                 .action(clap::ArgAction::SetFalse)

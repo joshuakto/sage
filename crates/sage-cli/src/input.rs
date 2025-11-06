@@ -1,6 +1,7 @@
 use anyhow::{ensure, Context};
 use clap::ArgMatches;
 use sage_cloudpath::{tdf::BrukerProcessingConfig, CloudPath};
+use sage_core::calibration::CalibrationMode;
 use sage_core::scoring::ScoreType;
 use sage_core::{
     database::{Builder, Parameters},
@@ -47,6 +48,7 @@ pub struct Search {
     pub annotate_matches: bool,
 
     pub score_type: ScoreType,
+    pub calibration_mode: CalibrationMode,
 }
 
 #[derive(Deserialize)]
@@ -76,6 +78,7 @@ pub struct Input {
     pub write_pin: Option<bool>,
     pub write_report: Option<bool>,
     pub score_type: Option<ScoreType>,
+    pub calibration_mode: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -274,6 +277,10 @@ impl Input {
             input.annotate_matches = Some(annotate_matches);
         }
 
+        if let Some(calibration_mode) = matches.get_one::<String>("calibration-mode") {
+            input.calibration_mode = Some(calibration_mode.clone());
+        }
+
         // avoid to later panic if these parameters are not set (but doesn't check if files exist)
 
         ensure!(
@@ -378,6 +385,12 @@ impl Input {
 
         let score_type = self.score_type.unwrap_or(ScoreType::SageHyperScore);
 
+        let calibration_mode = self
+            .calibration_mode
+            .as_ref()
+            .and_then(|s| CalibrationMode::from_str(s))
+            .unwrap_or_default();
+
         Ok(Search {
             version: clap::crate_version!().into(),
             database,
@@ -404,6 +417,7 @@ impl Input {
             bruker_config: self.bruker_config.unwrap_or_default(),
             write_report: self.write_report.unwrap_or(false),
             score_type,
+            calibration_mode,
         })
     }
 }

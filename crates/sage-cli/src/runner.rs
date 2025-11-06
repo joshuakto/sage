@@ -549,6 +549,67 @@ impl Runner {
         let q_peptide = sage_core::fdr::picked_peptide(&self.database, &mut outputs.features);
         let q_protein = sage_core::fdr::picked_protein(&self.database, &mut outputs.features);
 
+        // Assess mass calibration quality using high-confidence PSMs
+        let calibration_report = sage_core::calibration::assess_calibration(&outputs.features, 0.001);
+
+        // Log calibration status based on mode
+        use sage_core::calibration::{CalibrationMode, CalibrationQuality};
+        match calibration_report.quality {
+            CalibrationQuality::Good => {
+                log::info!(
+                    "✓ Good mass calibration detected (median error: {:.2} ppm)",
+                    calibration_report.median_error_ppm
+                );
+            }
+            CalibrationQuality::Fair => {
+                log::warn!(
+                    "⚠️  Fair mass calibration (median error: {:.2} ppm, expected <2 ppm)",
+                    calibration_report.median_error_ppm
+                );
+                if calibration_report.should_correct {
+                    match self.parameters.calibration_mode {
+                        CalibrationMode::Auto => {
+                            log::warn!("   Consider re-calibrating instrument or using tighter tolerances");
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            CalibrationQuality::Poor => {
+                log::warn!("⚠️  POOR MASS CALIBRATION DETECTED");
+                log::warn!("   Median mass error: {:.2} ppm (expected <2 ppm for high-quality instruments)",
+                          calibration_report.median_error_ppm);
+                log::warn!("   Std deviation: {:.2} ppm | MAD: {:.2} ppm",
+                          calibration_report.std_dev_ppm,
+                          calibration_report.mad_ppm);
+                log::warn!("   PSMs within tolerance: 1ppm={:.1}% | 3ppm={:.1}% | 5ppm={:.1}%",
+                          calibration_report.within_1ppm_pct,
+                          calibration_report.within_3ppm_pct,
+                          calibration_report.within_5ppm_pct);
+
+                if calibration_report.should_correct {
+                    match self.parameters.calibration_mode {
+                        CalibrationMode::Auto => {
+                            log::warn!("   ⚠️  Mass recalibration would help but is not yet implemented in Phase 1");
+                            log::warn!("   Recommendation: Check instrument calibration before re-acquisition");
+                            log::warn!("   Use --calibration-mode strict to enforce quality standards");
+                        }
+                        CalibrationMode::Strict => {
+                            log::warn!("   Strict mode: No automatic correction applied");
+                            log::warn!("   This may significantly reduce identification rates");
+                        }
+                        CalibrationMode::Adaptive => {
+                            log::info!("   Adaptive mode: Mass recalibration would be applied (not yet implemented)");
+                        }
+                    }
+                } else {
+                    log::warn!("   Confidence too low for automatic correction (n={}, conf={:.2})",
+                              calibration_report.num_psms_used,
+                              calibration_report.confidence);
+                }
+            }
+        }
+
         let filenames = self
             .parameters
             .mzml_paths
@@ -715,6 +776,11 @@ impl Runner {
                 }
             }
         }
+
+        // Write calibration QC report
+        self.parameters
+            .output_paths
+            .push(self.write_calibration_report(&calibration_report)?);
 
         // Write percolator input file if requested
         if self.parameters.write_pin {
@@ -1294,6 +1360,16 @@ impl Runner {
         wtr.flush()?;
 
         let bytes = wtr.into_inner()?;
+        path.write_bytes_sync(bytes)?;
+        Ok(path.to_string())
+    }
+
+    pub fn write_calibration_report(
+        &self,
+        report: &sage_core::calibration::CalibrationReport,
+    ) -> anyhow::Result<String> {
+        let path = self.make_path("calibration_qc.json");
+        let bytes = serde_json::to_vec_pretty(report)?;
         path.write_bytes_sync(bytes)?;
         Ok(path.to_string())
     }
