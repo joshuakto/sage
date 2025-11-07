@@ -126,13 +126,14 @@ pub fn apply_per_file_mz_correction(
     corrected
 }
 
-/// Assess mass calibration quality from high-scoring PSMs for a specific file
+/// Assess mass calibration quality from ALL target PSMs for a specific file
 ///
-/// This function analyzes the precursor mass errors from high-scoring target PSMs
+/// This function analyzes the precursor mass errors from all target PSMs
 /// to detect systematic mass offset that might indicate poor instrument calibration.
 ///
-/// IMPORTANT: Uses hyperscore/poisson-based filtering instead of FDR (spectrum_q)
-/// to avoid bias from global FDR calculated on mixed file distributions.
+/// IMPORTANT: Uses ALL target PSMs to avoid any selection bias. Previous attempts
+/// to use "top-scoring" PSMs introduced bias because scoring metrics can be
+/// anti-correlated with mass accuracy in poorly calibrated data.
 ///
 /// # Arguments
 /// * `features` - Array of PSM features from database search
@@ -146,35 +147,15 @@ pub fn assess_calibration(
     _fdr_threshold: f32,
     file_id: Option<usize>,
 ) -> CalibrationReport {
-    // Filter to target PSMs (optionally for specific file)
-    // We select top PSMs by combined score (hyperscore + poisson) to avoid
-    // bias from global FDR calculated on mixed calibration states
-    let mut scored_features: Vec<_> = features
+    // Collect mass errors from ALL target PSMs (optionally for specific file)
+    // We use all targets to avoid selection bias - any filtering (by score, FDR, etc.)
+    // can introduce bias if the filtering criteria are correlated with mass error
+    let mut mass_errors: Vec<f32> = features
         .iter()
         .filter(|f| {
             f.label == 1
                 && file_id.map_or(true, |id| f.file_id == id)
         })
-        .map(|f| {
-            // Combined score: high hyperscore is good, low poisson is good
-            let score = f.hyperscore.ln_1p() - f.poisson.ln_1p() * 10.0;
-            (f, score)
-        })
-        .collect();
-
-    // Sort by score descending (best first)
-    scored_features.sort_by(|a, b| b.1.total_cmp(&a.1));
-
-    // Take top N PSMs for calibration assessment
-    // Use up to 5000 PSMs or 10% of targets, whichever is smaller
-    let max_psms = (scored_features.len() / 10).max(500).min(5000);
-    let selected_features: Vec<_> = scored_features.iter()
-        .take(max_psms)
-        .map(|(f, _)| *f)
-        .collect();
-
-    let mut mass_errors: Vec<f32> = selected_features
-        .iter()
         .map(|f| f.delta_mass)
         .collect();
 

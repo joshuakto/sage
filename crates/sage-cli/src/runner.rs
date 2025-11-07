@@ -558,42 +558,14 @@ impl Runner {
 
         log::info!("Assessing mass calibration for {} files...", num_files);
 
-        for file_id in 0..num_files {
-            // Calculate raw median for this file BEFORE any FDR filtering
-            let raw_median = {
-                let mut deltas: Vec<f32> = outputs.features
-                    .iter()
-                    .filter(|f| f.label == 1 && f.file_id == file_id)
-                    .map(|f| f.delta_mass)
-                    .collect();
-                if deltas.is_empty() {
-                    0.0
-                } else {
-                    deltas.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                    if deltas.len() % 2 == 0 {
-                        (deltas[deltas.len() / 2 - 1] + deltas[deltas.len() / 2]) / 2.0
-                    } else {
-                        deltas[deltas.len() / 2]
-                    }
-                }
-            };
+        // Store per-file calibration reports for output
+        let mut per_file_reports: Vec<(String, sage_core::calibration::CalibrationReport)> = Vec::new();
 
+        for file_id in 0..num_files {
             let calibration_report = sage_core::calibration::assess_calibration(
                 &outputs.features,
                 self.parameters.calibration.fdr_threshold,
                 Some(file_id),
-            );
-
-            log::debug!(
-                "  File {} raw median (all targets): {:.2} ppm",
-                file_id,
-                raw_median
-            );
-            log::debug!(
-                "  File {} assessed median (top PSMs): {:.2} ppm, n={}",
-                file_id,
-                calibration_report.median_error_ppm,
-                calibration_report.num_psms_used
             );
 
             let filename = self
@@ -647,6 +619,9 @@ impl Runner {
                     }
                 }
             }
+
+            // Store report for output
+            per_file_reports.push((filename.clone(), calibration_report));
         }
 
         // Apply per-file correction BEFORE final FDR if approved
@@ -866,12 +841,18 @@ impl Runner {
             }
         }
 
-        // Write calibration QC report (for now, write a global summary for backward compat)
-        // TODO: Write per-file calibration reports
+        // Write per-file calibration QC reports
+        for (filename, report) in &per_file_reports {
+            self.parameters
+                .output_paths
+                .push(self.write_per_file_calibration_report(filename, report)?);
+        }
+
+        // Also write global calibration summary
         let global_calibration_report = sage_core::calibration::assess_calibration(
             &outputs.features,
             self.parameters.calibration.fdr_threshold,
-            None, // Global assessment
+            None, // Global assessment across all files
         );
         self.parameters
             .output_paths
@@ -1464,6 +1445,23 @@ impl Runner {
         report: &sage_core::calibration::CalibrationReport,
     ) -> anyhow::Result<String> {
         let path = self.make_path("calibration_qc.json");
+        let bytes = serde_json::to_vec_pretty(report)?;
+        path.write_bytes_sync(bytes)?;
+        Ok(path.to_string())
+    }
+
+    pub fn write_per_file_calibration_report(
+        &self,
+        filename: &str,
+        report: &sage_core::calibration::CalibrationReport,
+    ) -> anyhow::Result<String> {
+        // Sanitize filename for use in output path (remove path separators, .mzML extension)
+        let clean_name = filename
+            .replace(['/', '\\', ':'], "_")
+            .replace(".mzML", "")
+            .replace(".mzml", "");
+        let output_filename = format!("calibration_qc_{}.json", clean_name);
+        let path = self.make_path(&output_filename);
         let bytes = serde_json::to_vec_pretty(report)?;
         path.write_bytes_sync(bytes)?;
         Ok(path.to_string())
