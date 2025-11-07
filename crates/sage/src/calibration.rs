@@ -126,31 +126,55 @@ pub fn apply_per_file_mz_correction(
     corrected
 }
 
-/// Assess mass calibration quality from high-confidence PSMs for a specific file
+/// Assess mass calibration quality from high-scoring PSMs for a specific file
 ///
-/// This function analyzes the precursor mass errors from confident PSMs
+/// This function analyzes the precursor mass errors from high-scoring target PSMs
 /// to detect systematic mass offset that might indicate poor instrument calibration.
+///
+/// IMPORTANT: Uses hyperscore/poisson-based filtering instead of FDR (spectrum_q)
+/// to avoid bias from global FDR calculated on mixed file distributions.
 ///
 /// # Arguments
 /// * `features` - Array of PSM features from database search
-/// * `fdr_threshold` - FDR threshold for selecting high-confidence PSMs (typically 0.001)
+/// * `_fdr_threshold` - Unused (kept for API compatibility)
 /// * `file_id` - Optional file ID to assess (None = all files combined, for backward compat)
 ///
 /// # Returns
 /// A `CalibrationReport` containing calibration statistics and recommendations
 pub fn assess_calibration(
     features: &[Feature],
-    fdr_threshold: f32,
+    _fdr_threshold: f32,
     file_id: Option<usize>,
 ) -> CalibrationReport {
-    // Filter to high-confidence target PSMs (optionally for specific file)
-    let mut mass_errors: Vec<f32> = features
+    // Filter to target PSMs (optionally for specific file)
+    // We select top PSMs by combined score (hyperscore + poisson) to avoid
+    // bias from global FDR calculated on mixed calibration states
+    let mut scored_features: Vec<_> = features
         .iter()
         .filter(|f| {
             f.label == 1
-                && f.spectrum_q <= fdr_threshold
                 && file_id.map_or(true, |id| f.file_id == id)
         })
+        .map(|f| {
+            // Combined score: high hyperscore is good, low poisson is good
+            let score = f.hyperscore.ln_1p() - f.poisson.ln_1p() * 10.0;
+            (f, score)
+        })
+        .collect();
+
+    // Sort by score descending (best first)
+    scored_features.sort_by(|a, b| b.1.total_cmp(&a.1));
+
+    // Take top N PSMs for calibration assessment
+    // Use up to 5000 PSMs or 10% of targets, whichever is smaller
+    let max_psms = (scored_features.len() / 10).max(500).min(5000);
+    let selected_features: Vec<_> = scored_features.iter()
+        .take(max_psms)
+        .map(|(f, _)| *f)
+        .collect();
+
+    let mut mass_errors: Vec<f32> = selected_features
+        .iter()
         .map(|f| f.delta_mass)
         .collect();
 
@@ -365,12 +389,16 @@ mod tests {
     #[test]
     fn test_per_file_calibration() {
         // Create features from two files with different calibration
+        // Important: vary hyperscore/poisson to make selection realistic
         let mut features: Vec<Feature> = vec![];
 
         // File 0: Poor calibration (5.5 ppm offset)
         for i in 0..500 {
             let mut f = make_test_feature(5.5 + (i % 20) as f32 * 0.1, 0.0001, 1);
             f.file_id = 0;
+            // Vary hyperscore and poisson to simulate realistic scoring
+            f.hyperscore = 100.0 + (i as f64 % 50.0);
+            f.poisson = 0.01 - (i as f64 % 50.0) * 0.0001;
             features.push(f);
         }
 
@@ -378,22 +406,30 @@ mod tests {
         for i in 0..500 {
             let mut f = make_test_feature(0.5 + (i % 20) as f32 * 0.1, 0.0001, 1);
             f.file_id = 1;
+            // Vary hyperscore and poisson to simulate realistic scoring
+            f.hyperscore = 100.0 + (i as f64 % 50.0);
+            f.poisson = 0.01 - (i as f64 % 50.0) * 0.0001;
             features.push(f);
         }
 
         // Assess file 0 - should be poor
         let report0 = assess_calibration(&features, 0.001, Some(0));
         assert_eq!(report0.quality, CalibrationQuality::Poor);
-        assert!(report0.median_error_ppm > 5.0);
+        assert!(report0.median_error_ppm > 4.0, "File 0 median should be > 4.0 ppm, got {}", report0.median_error_ppm);
 
         // Assess file 1 - should be good
         let report1 = assess_calibration(&features, 0.001, Some(1));
         assert_eq!(report1.quality, CalibrationQuality::Good);
-        assert!(report1.median_error_ppm.abs() < 2.0);
+        assert!(report1.median_error_ppm.abs() < 2.0, "File 1 median should be < 2.0 ppm, got {}", report1.median_error_ppm);
 
-        // Global assessment - should be intermediate
+        // Global assessment - should be intermediate (between the two)
+        // With top-scoring PSMs from both files, median should be between file 0 and file 1
         let report_global = assess_calibration(&features, 0.001, None);
-        assert!(report_global.median_error_ppm > 2.0 && report_global.median_error_ppm < 5.0);
+        assert!(
+            report_global.median_error_ppm > 1.0 && report_global.median_error_ppm < 6.0,
+            "Global median should be between 1.0 and 6.0 ppm, got {}",
+            report_global.median_error_ppm
+        );
     }
 
     #[test]

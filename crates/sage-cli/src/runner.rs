@@ -545,10 +545,13 @@ impl Runner {
             None
         };
 
-        // FIRST PASS: Initial FDR calculation to assess calibration
+        // FIRST PASS: Initial FDR calculation to identify high-quality PSMs
+        // Note: This is used for RT alignment, NOT for calibration assessment
         let _q_spectrum_initial = self.spectrum_fdr(&mut outputs.features);
 
-        // Assess mass calibration quality PER FILE using high-confidence PSMs from first pass
+        // Assess mass calibration quality PER FILE using high-scoring target PSMs
+        // IMPORTANT: We use score-based filtering (hyperscore/poisson) instead of
+        // FDR-based filtering to avoid bias from global FDR on mixed distributions
         let num_files = self.parameters.mzml_paths.len();
         let mut per_file_corrections: Vec<(usize, f32)> = Vec::new();
         let mut any_correction_needed = false;
@@ -556,10 +559,41 @@ impl Runner {
         log::info!("Assessing mass calibration for {} files...", num_files);
 
         for file_id in 0..num_files {
+            // Calculate raw median for this file BEFORE any FDR filtering
+            let raw_median = {
+                let mut deltas: Vec<f32> = outputs.features
+                    .iter()
+                    .filter(|f| f.label == 1 && f.file_id == file_id)
+                    .map(|f| f.delta_mass)
+                    .collect();
+                if deltas.is_empty() {
+                    0.0
+                } else {
+                    deltas.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    if deltas.len() % 2 == 0 {
+                        (deltas[deltas.len() / 2 - 1] + deltas[deltas.len() / 2]) / 2.0
+                    } else {
+                        deltas[deltas.len() / 2]
+                    }
+                }
+            };
+
             let calibration_report = sage_core::calibration::assess_calibration(
                 &outputs.features,
                 self.parameters.calibration.fdr_threshold,
                 Some(file_id),
+            );
+
+            log::debug!(
+                "  File {} raw median (all targets): {:.2} ppm",
+                file_id,
+                raw_median
+            );
+            log::debug!(
+                "  File {} assessed median (top PSMs): {:.2} ppm, n={}",
+                file_id,
+                calibration_report.median_error_ppm,
+                calibration_report.num_psms_used
             );
 
             let filename = self
@@ -628,6 +662,28 @@ impl Runner {
                 corrected_count,
                 per_file_corrections.len()
             );
+
+            // Verify correction by checking post-correction medians
+            for file_id in 0..num_files {
+                let mut deltas: Vec<f32> = outputs.features
+                    .iter()
+                    .filter(|f| f.label == 1 && f.file_id == file_id)
+                    .map(|f| f.delta_mass)
+                    .collect();
+                if !deltas.is_empty() {
+                    deltas.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let post_median = if deltas.len() % 2 == 0 {
+                        (deltas[deltas.len() / 2 - 1] + deltas[deltas.len() / 2]) / 2.0
+                    } else {
+                        deltas[deltas.len() / 2]
+                    };
+                    log::debug!(
+                        "  File {} median after correction: {:.2} ppm",
+                        file_id,
+                        post_median
+                    );
+                }
+            }
 
             // SECOND PASS: Recalculate FDR with corrected delta_mass values
             // This ensures q-values reflect the corrected mass errors
